@@ -269,6 +269,21 @@ If failed_attempt_count >= lockout_threshold (default: 5)
 
 All thresholds and durations are configurable via system configuration (see Section 16).
 
+**Prior Lockout Tracking:**
+
+The system SHALL track the number of prior lockouts using a `lockout_history_count` column on the `credentials` table:
+
+- `lockout_history_count` is initialized to `0` on credential creation.
+- `lockout_history_count` is incremented by 1 each time a new lockout is triggered (regardless of tier).
+- `lockout_history_count` SHALL NOT be reset when a temporary lockout expires or is manually unlocked — it is a cumulative lifetime counter.
+- The tier determination uses `lockout_history_count` BEFORE incrementing:
+
+| `lockout_history_count` (before increment) | Tier Applied |
+|---|---|
+| 0 | LOCKED_TEMPORARY, 30 minutes |
+| 1 | LOCKED_TEMPORARY, 2 hours |
+| >= 2 | LOCKED_PERMANENT |
+
 ### FR-LOGIN-010: MFA Session State
 
 When MFA is required, the system SHALL:
