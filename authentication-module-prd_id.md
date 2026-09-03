@@ -126,9 +126,9 @@ Domain Discovery dilakukan menggunakan metodologi Event Storming, dengan menelaa
 
 | Aktor | Tipe | Pola Interaksi |
 |---|---|---|
-| Bank Administrator | Manusia | Peramban web melalui Bank Administration Portal |
-| Corporate User | Manusia | Peramban web melalui Corporate Portal |
-| Mobile Approver | Manusia | Aplikasi mobile native |
+| Bank Administrator | Manusia | Peramban web melalui Bank Administration Portal; login tanpa company code (realm internal bank) |
+| Corporate User | Manusia | Peramban web melalui Corporate Portal; login dengan company code + username |
+| Mobile Approver | Manusia | Aplikasi mobile native; login dengan company code + username |
 | API Client (Mesin) | Sistem | Alur OAuth2 Client Credentials |
 | Layanan Hilir | Sistem | Introspeksi token |
 | Sistem Fraud/Risiko | Sistem | Pelanggan event (subscriber) |
@@ -339,7 +339,9 @@ Keputusan arsitektural terpenting adalah pemisahan antara **Authentication** dan
 ## 6.2 Relasi Konteks Secara Rinci
 
 ### Authentication ↔ Identity Context
-**Relasi:** Customer/Supplier (Identity berada di Upstream). Authentication melakukan kueri ke Identity untuk memeriksa keberadaan/status aktif melalui Anti-Corruption Layer. Authentication mendefinisikan value object `IdentityRef` miliknya sendiri; perubahan skema Identity hanya memengaruhi adapter ACL.
+**Relasi:** Customer/Supplier (Identity berada di Upstream). Authentication melakukan kueri ke Identity untuk me-resolve pengenal login menjadi identitas serta memeriksa keberadaan/status aktif, melalui Anti-Corruption Layer. Authentication mendefinisikan value object `IdentityRef` dan `LoginIdentifier` miliknya sendiri; perubahan skema Identity hanya memengaruhi adapter ACL.
+
+**Kontrak port resolusi:** `resolveIdentity(LoginIdentifier) -> IdentityRef | NOT_FOUND`, dengan `LoginIdentifier` = (`company_code`, `username`). Identity Context adalah pemilik pemetaan korporasi→pengguna dan penegak keunikan `username` di dalam satu `company_code`; Authentication tidak pernah menyimpan maupun memvalidasi sendiri pemetaan tersebut. Port mengembalikan `NOT_FOUND` yang sama baik korporasinya tidak ada maupun penggunanya tidak ada — pemanggil tidak boleh dapat membedakannya.
 
 ### Authentication → Notification Context
 **Relasi:** Authentication berada di Upstream. Event asinkron memicu pengiriman notifikasi (OTP, tautan reset kata sandi, peringatan keamanan). Authentication tidak pernah menunggu Notification — kegagalan notifikasi tidak menyebabkan autentikasi gagal.
@@ -400,6 +402,7 @@ Melindungi invarian: hanya satu token dalam satu family yang boleh `ACTIVE` pada
 | Value Object | Digunakan Di | Mengapa Berupa Value Object |
 |---|---|---|
 | `IdentityRef` | Semua aggregate | Referensi opak; kesetaraan berdasarkan nilai |
+| `LoginIdentifier` | Login, ACL Identity | Tuple (`company_code`, `username`) yang dinormalisasi; hanya bermakna sebagai satu kesatuan |
 | `PasswordHash` | CredentialAggregate | Mengenkapsulasi logika hashing Argon2id |
 | `DeviceFingerprint` | RegisteredDevice | Dihitung dari atribut; imutabel |
 | `AuthenticationAssuranceLevel` | AuthenticationSession | Seperti enum; kesetaraan berdasarkan nilai |
@@ -433,15 +436,28 @@ Melindungi invarian: hanya satu token dalam satu family yang boleh `ACTIVE` pada
 
 ## 8.1 Login
 
-**FR-LOGIN-001: Autentikasi Username/Kata Sandi**
-Menerima username dan kata sandi, memverifikasi terhadap hash tersimpan menggunakan Argon2id, dan mengembalikan hasil autentikasi.
+**FR-LOGIN-001: Autentikasi Company Code/Username/Kata Sandi**
+Menerima **Company Code**, **Username**, dan kata sandi. Sistem me-resolve pasangan (`company_code`, `username`) menjadi satu `identity_id` melalui Anti-Corruption Layer ke Identity Context, lalu memverifikasi kata sandi terhadap hash tersimpan menggunakan Argon2id dan mengembalikan hasil autentikasi.
+
+**Aturan pengenal:**
+- `username` **hanya unik di dalam lingkup satu `company_code`**. Dua korporasi berbeda boleh memiliki `username` yang identik. Karena itu `username` saja tidak pernah cukup untuk mengidentifikasi principal.
+- `company_code` bersifat case-insensitive dan dinormalisasi (uppercase, trim) sebelum resolusi maupun sebelum dipakai sebagai kunci rate limit.
+- Resolusi pengenal wajib terjadi **sebelum** verifikasi kata sandi, karena kebijakan lockout dan kebijakan MFA dievaluasi per identitas.
+
+**Aktor tanpa korporasi (Bank Administrator):**
+Bank Administrator tidak dimiliki oleh korporasi mana pun. Untuk klien Bank Administration Portal, `company_code` **dihilangkan** dari permintaan dan resolusi dilakukan di dalam realm internal bank. Modul menentukan realm dari `client_id`, bukan dari masukan pengguna — sehingga pengguna korporasi tidak dapat menjangkau realm bank admin dengan mengosongkan `company_code`. Menghilangkan `company_code` pada klien korporasi adalah `400 Bad Request`.
+
+**Pencegahan enumerasi korporasi:**
+`company_code` yang tidak dikenal harus menghasilkan respons, kode status, dan profil waktu yang identik dengan kata sandi salah (lihat FR-LOGIN-003). Sistem tidak boleh mengungkapkan apakah suatu korporasi terdaftar.
 
 **FR-LOGIN-002: Autentikasi Email/Kata Sandi (Siap untuk Masa Depan)**
-Arsitektur harus mendukung email sebagai pengenal login tanpa perubahan skema. Pencarian kredensial harus agnostik terhadap tipe pengenal. Implementasi ditunda ke Fase 2.
+Arsitektur harus mendukung email sebagai pengenal login tanpa perubahan skema. Pencarian kredensial harus agnostik terhadap tipe pengenal: port resolusi menerima value object `LoginIdentifier` dan tidak mengasumsikan bentuk `username`. Implementasi ditunda ke Fase 2.
+
+Karena email bersifat unik secara global, alur berbasis email pada Fase 2 boleh menghilangkan `company_code`. Aturannya ditentukan oleh tipe pengenal, bukan oleh klien: `USERNAME` mensyaratkan `company_code`, `EMAIL` tidak.
 
 **FR-LOGIN-003: Penanganan Login Gagal**
 - Menaikkan penghitung percobaan gagal pada setiap kegagalan
-- Mengembalikan pesan galat generik yang tidak membedakan antara "pengguna tidak ditemukan" dan "kata sandi salah"
+- Mengembalikan pesan galat generik yang tidak membedakan antara "korporasi tidak dikenal", "pengguna tidak ditemukan", dan "kata sandi salah"
 - Menerapkan kebijakan lockout yang dapat dikonfigurasi setelah N kegagalan berturut-turut dalam jendela waktu (default: 5 kegagalan dalam 15 menit)
 - Memancarkan domain event `LoginFailed`
 
@@ -453,7 +469,9 @@ Dua mode penguncian:
 Kebijakan eskalasi (dapat dikonfigurasi): Lockout pertama → Temporary (30 menit); Kedua → Temporary (2 jam); Ketiga → Permanent.
 
 **FR-LOGIN-005: Audit Login**
-Setiap percobaan login (berhasil maupun gagal) harus dipersistensi sebagai catatan `LoginAttempt` yang berisi: identity_id, timestamp, outcome, failure_reason, ip_address, user_agent, device_fingerprint, session_id (bila berhasil).
+Setiap percobaan login (berhasil maupun gagal) harus dipersistensi sebagai catatan `LoginAttempt` yang berisi: identity_id, company_code_used, username_used, timestamp, outcome, failure_reason, ip_address, user_agent, device_fingerprint, session_id (bila berhasil).
+
+`company_code_used` dan `username_used` dicatat **sebagaimana dikirimkan** (setelah normalisasi), termasuk ketika resolusi gagal dan `identity_id` bernilai NULL. Tanpa keduanya, percobaan terhadap korporasi yang tidak ada tidak dapat diinvestigasi.
 
 **FR-LOGIN-006: Kebijakan Sesi Simultan**
 Kebijakan yang dapat dikonfigurasi: Izinkan semua sesi bersamaan; Batasi N (yang terlama dibatalkan); Sesi tunggal (sesi sebelumnya dicabut saat login baru).
@@ -553,7 +571,7 @@ Pengguna terautentikasi dapat melihat seluruh perangkat terdaftar dan mencabut s
 - Harus memuat: huruf besar, huruf kecil, angka, karakter khusus
 - Panjang maksimum: 128 karakter (pencegahan DoS)
 - Daftar blokir kata sandi umum (minimum 100.000 entri)
-- Username tidak boleh terkandung di dalam kata sandi
+- Username dan company code tidak boleh terkandung di dalam kata sandi
 
 **FR-PWD-002: Riwayat Kata Sandi**
 Mencegah penggunaan ulang N kata sandi terakhir (default: 12). Entri riwayat hanya menyimpan hash.
@@ -562,7 +580,7 @@ Mencegah penggunaan ulang N kata sandi terakhir (default: 12). Entri riwayat han
 Default: 90 hari (bank admin), 180 hari (pengguna korporasi). Peringatan pada 14, 7, 3, dan 1 hari sebelum kedaluwarsa. Saat kedaluwarsa, pengguna dipaksa mengubah kata sandi sebelum mengakses sumber daya terlindungi.
 
 **FR-PWD-004: Lupa Kata Sandi**
-1. Pengguna mengirimkan pengenal; sistem selalu mengembalikan respons yang sama (mencegah enumerasi)
+1. Pengguna mengirimkan `company_code` dan `username`; sistem selalu mengembalikan respons yang sama, termasuk ketika korporasi tidak dikenal (mencegah enumerasi korporasi maupun pengguna)
 2. Jika identitas ada: bangkitkan token reset sekali pakai berumur pendek (TTL 60 menit)
 3. Memancarkan event `PasswordResetRequested` → Notification Context mengirim tautan reset
 
@@ -612,13 +630,16 @@ Mempublikasikan kunci publik penandatanganan di `/.well-known/jwks.json` (RFC 75
 # 9. User Story & Kriteria Penerimaan
 
 ## US-001: Login Standar
-**Sebagai** Corporate User, **saya ingin** masuk menggunakan username dan kata sandi, **agar** saya dapat mengakses Corporate Portal.
+**Sebagai** Corporate User, **saya ingin** masuk menggunakan Company Code, Username, dan kata sandi, **agar** saya dapat mengakses Corporate Portal.
 
 **Kriteria Penerimaan:**
 - Kredensial valid mengembalikan Access Token dan Refresh Token dalam waktu 3 detik
-- Kredensial tidak valid mengembalikan galat generik (tanpa membedakan username/kata sandi)
-- 5 kegagalan berturut-turut dalam 15 menit memicu penguncian akun
-- Setiap percobaan dicatat dalam log audit beserta IP, user agent, dan timestamp
+- Kredensial tidak valid mengembalikan galat generik (tanpa membedakan company code/username/kata sandi)
+- `company_code` yang tidak dikenal mengembalikan galat dan waktu respons yang identik dengan kata sandi salah
+- `username` yang sama di dua korporasi berbeda me-resolve ke identitas yang berbeda dan tidak saling memengaruhi
+- Permintaan tanpa `company_code` dari klien korporasi ditolak dengan 400
+- 5 kegagalan berturut-turut dalam 15 menit memicu penguncian akun; penguncian terbatas pada satu identitas dan tidak memengaruhi `username` sama di korporasi lain
+- Setiap percobaan dicatat dalam log audit beserta company code, username, IP, user agent, dan timestamp
 
 ## US-002: Login dengan MFA Wajib
 **Sebagai** Bank Administrator, **saya ingin** menyelesaikan MFA setelah memasukkan kata sandi, **agar** akun istimewa saya terlindungi oleh faktor kedua.
@@ -660,7 +681,7 @@ Mempublikasikan kunci publik penandatanganan di `/.well-known/jwks.json` (RFC 75
 **Sebagai** pengguna yang lupa kata sandinya, **saya ingin** meresetnya melalui tautan email, **agar** saya dapat memperoleh kembali akses.
 
 **Kriteria Penerimaan:**
-- Mengirim pengenal apa pun selalu menampilkan "jika akun tersebut ada, Anda akan menerima email"
+- Mengirim kombinasi company code/username apa pun selalu menampilkan "jika akun tersebut ada, Anda akan menerima email"
 - Tautan reset bersifat sekali pakai dan berlaku selama 60 menit
 - Kata sandi baru harus memenuhi kebijakan kata sandi
 - Seluruh sesi lain dibatalkan setelah reset
@@ -785,7 +806,8 @@ Seluruh API: JSON, diversikan di bawah `/api/v1/auth`, wajib HTTPS. Galat mengik
 **Request:**
 ```json
 {
-  "identifier": "john.smith",
+  "company_code": "ACME01",
+  "username": "john.smith",
   "password": "S3cur3P@ssword!",
   "device_fingerprint": {
     "user_agent": "Mozilla/5.0...",
@@ -822,9 +844,12 @@ Seluruh API: JSON, diversikan di bawah `/api/v1/auth`, wajib HTTPS. Galat mengik
 }
 ```
 
-**Response 401:** Galat generik kredensial tidak valid.
+**Response 400:** `company_code` tidak ada pada klien korporasi, atau format pengenal tidak valid.
+**Response 401:** Galat generik kredensial tidak valid — dikembalikan secara identik untuk company code tidak dikenal, username tidak dikenal, dan kata sandi salah.
 **Response 423:** Akun terkunci (menyertakan `locked_until`).
 **Response 429:** Terkena rate limit (menyertakan `retry_after`).
+
+**Catatan `company_code`:** Wajib untuk klien korporasi (`corporate-portal`, aplikasi mobile). Dihilangkan untuk `bank-admin-portal`, yang di-resolve di dalam realm internal bank. Realm ditentukan dari `client_id` yang terautentikasi, bukan dari ada atau tidaknya field ini.
 
 ### POST /api/v1/auth/mfa/verify
 
@@ -925,8 +950,8 @@ Mencabut perangkat dan seluruh sesi terkait. Mengembalikan 204.
 **Response:** 204 No Content.
 
 ### POST /api/v1/auth/password/forgot
-**Request:** `{ "identifier": "john.smith" }`
-**Response:** Selalu 200 dengan pesan generik.
+**Request:** `{ "company_code": "ACME01", "username": "john.smith" }`
+**Response:** Selalu 200 dengan pesan generik — termasuk ketika `company_code` tidak dikenal.
 
 ### POST /api/v1/auth/password/reset
 **Request:** `{ "reset_token": "...", "new_password": "..." }`
@@ -1147,7 +1172,8 @@ CREATE UNIQUE INDEX idx_devices_fingerprint ON registered_devices(identity_id, f
 CREATE TABLE login_attempts (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     identity_id         UUID,
-    identifier_used     VARCHAR(256) NOT NULL,
+    company_code_used   VARCHAR(64),
+    username_used       VARCHAR(256) NOT NULL,
     outcome             VARCHAR(32) NOT NULL,
     failure_reason      VARCHAR(64),
     session_id          UUID REFERENCES authentication_sessions(id),
@@ -1160,6 +1186,7 @@ CREATE TABLE login_attempts (
 ) PARTITION BY RANGE (attempted_at);
 
 CREATE INDEX idx_login_attempts_identity ON login_attempts(identity_id, attempted_at DESC);
+CREATE INDEX idx_login_attempts_company ON login_attempts(company_code_used, attempted_at DESC);
 CREATE INDEX idx_login_attempts_ip ON login_attempts(ip_address, attempted_at DESC);
 CREATE INDEX idx_login_attempts_outcome ON login_attempts(outcome, attempted_at DESC);
 ```
@@ -1243,6 +1270,7 @@ Seluruh event dipublikasikan ke Kafka dengan envelope:
 ```json
 {
   "identity_id": "identity_01H9XZ...",
+  "company_code": "ACME01",
   "session_id": "sess_01H9XZ...",
   "device_id": "dev_xyz789...",
   "is_new_device": false,
@@ -1263,6 +1291,7 @@ Seluruh event dipublikasikan ke Kafka dengan envelope:
 ```json
 {
   "identity_id": "identity_01H9XZ...",
+  "company_code": "ACME01",
   "failure_reason": "INVALID_CREDENTIALS",
   "failed_attempt_count": 3,
   "ip_address": "203.0.113.42",
@@ -1272,7 +1301,11 @@ Seluruh event dipublikasikan ke Kafka dengan envelope:
 }
 ```
 
-Alasan kegagalan: `INVALID_CREDENTIALS`, `ACCOUNT_LOCKED`, `ACCOUNT_NOT_FOUND`, `INVALID_MFA_CODE`, `MFA_SESSION_EXPIRED`, `ACCOUNT_INACTIVE`
+`identity_id` bernilai null ketika resolusi pengenal gagal; `company_code` tetap diisi sebagaimana dikirimkan agar Fraud Context dapat mendeteksi penyisiran lintas korporasi.
+
+Alasan kegagalan: `INVALID_CREDENTIALS`, `ACCOUNT_LOCKED`, `ACCOUNT_NOT_FOUND`, `UNKNOWN_COMPANY_CODE`, `INVALID_MFA_CODE`, `MFA_SESSION_EXPIRED`, `ACCOUNT_INACTIVE`
+
+`UNKNOWN_COMPANY_CODE` bersifat internal: dicatat dalam event dan audit, tetapi tidak pernah tercermin dalam respons API (lihat FR-LOGIN-003).
 
 ## 13.3 AccountLocked
 
@@ -1583,14 +1616,26 @@ sequenceDiagram
     participant AP as API Gateway
     participant AS as Auth Service
     participant CR as Credentials DB
+    participant ID as Identity Context
     participant SD as Session DB
     participant RD as Redis
     participant KB as Kafka (Outbox)
 
-    U->>AP: POST /auth/login {identifier, password, device_fp}
+    U->>AP: POST /auth/login {company_code, username, password, device_fp}
     AP->>AS: Teruskan permintaan (rate limit diperiksa di gateway)
-    AS->>RD: Periksa rate limit untuk IP + identifier
+    AS->>AS: Normalisasi company_code; tentukan realm dari client_id
+    AS->>RD: Periksa rate limit untuk IP + company_code + username
     RD-->>AS: OK
+    AS->>ID: resolveIdentity(company_code, username) melalui ACL
+    alt Tidak ter-resolve (korporasi/pengguna tidak dikenal)
+        ID-->>AS: NOT_FOUND
+        AS->>AS: Jalankan verifikasi hash tiruan (waktu respons konstan)
+        AS->>KB: Publikasikan LoginFailed (outbox, identity_id null)
+        AS-->>AP: 401 Unauthorized (galat generik)
+        AP-->>U: 401
+    else Ter-resolve
+        ID-->>AS: identity_id
+    end
     AS->>CR: Cari credential berdasarkan identity_id
     CR-->>AS: Catatan credential
     AS->>AS: Verifikasi hash kata sandi (Argon2id)
@@ -1622,8 +1667,9 @@ sequenceDiagram
     participant RD as Redis
     participant KB as Kafka
 
-    U->>AP: POST /auth/login {identifier, password}
+    U->>AP: POST /auth/login {company_code, username, password}
     AP->>AS: Teruskan permintaan
+    AS->>AS: Resolve (company_code, username) -> identity_id melalui ACL
     AS->>CR: Verifikasi kata sandi
     CR-->>AS: Valid
     AS->>MFA: Periksa faktor MFA aktif
@@ -1727,9 +1773,9 @@ sequenceDiagram
     participant KB as Kafka
     participant NF as Notification Context
 
-    U->>AP: POST /auth/password/forgot {identifier}
+    U->>AP: POST /auth/password/forgot {company_code, username}
     AP->>AS: Teruskan permintaan
-    AS->>ID: Cari identitas berdasarkan identifier (ACL)
+    AS->>ID: resolveIdentity(company_code, username) melalui ACL
     alt Identitas tidak ditemukan
         AS->>AS: Catat percobaan; tanpa tindakan lanjutan
     else Identitas ditemukan
@@ -1947,11 +1993,14 @@ Untuk klien berbasis peramban:
 | API Gateway | 100 permintaan | 1 menit | Alamat IP |
 | Endpoint login | 10 percobaan | 5 menit | Alamat IP |
 | Endpoint login | 5 percobaan | 15 menit | Identitas + IP |
+| Endpoint login | 20 percobaan | 15 menit | `company_code` + IP (penyisiran username) |
 | Pengiriman ulang OTP | 3 pengiriman | 10 menit | Identitas |
-| Reset kata sandi | 3 permintaan | 60 menit | Identifier (di-hash) |
+| Reset kata sandi | 3 permintaan | 60 menit | `company_code` + `username` (di-hash) |
 | Introspeksi token | 1000 permintaan | 1 menit | client_id resource server |
 
 Penghitung sliding window berbasis Redis. Mengembalikan `429 Too Many Requests` dengan header `Retry-After`.
+
+**Isolasi tenant:** Setiap kunci rate limit dan lockout yang menyertakan pengenal pengguna harus mencakup `company_code`. Tanpa ini, penyerang yang menebak `username` umum (misalnya `admin`) dapat mengunci akun bernama sama di seluruh korporasi sekaligus — satu tenant dapat menyebabkan denial of service pada tenant lain.
 
 ## 16.10 Sidik Jari Perangkat (Device Fingerprinting)
 
