@@ -161,6 +161,8 @@ Domain Discovery dilakukan menggunakan metodologi Event Storming, dengan menelaa
 22. Reset kata sandi diminta
 23. Reset kata sandi selesai
 24. Kata sandi kedaluwarsa
+25. Akun dibuka kuncinya (otomatis atau oleh admin)
+26. Perubahan kata sandi dipaksakan oleh admin
 
 ## 3.3 Command yang Teridentifikasi
 
@@ -372,7 +374,7 @@ Melindungi invarian: sebuah sesi tidak bisa sekaligus aktif dan kedaluwarsa; ses
 ### Aggregate 2: `CredentialAggregate`
 Melindungi invarian: jumlah percobaan gagal selalu konsisten dengan status lockout; kedalaman riwayat kata sandi tidak pernah melebihi maksimum kebijakan; kredensial yang terkunci tidak dapat diverifikasi.
 
-**Berisi:** Credential ID, Identity Reference, Password Hash, Password Salt, Algoritma/Versi Kata Sandi, Password Created/Expires At, flag Force Password Change, Jumlah Percobaan Gagal, Status Lockout (`UNLOCKED`/`LOCKED_TEMPORARY`/`LOCKED_PERMANENT`), Locked Until, Password History (koleksi entity).
+**Berisi:** Credential ID, Identity Reference, Password Hash, Password Salt, Algoritma/Versi Kata Sandi, Password Created/Expires At, flag Force Password Change, Jumlah Percobaan Gagal, Status Lockout (`UNLOCKED`/`LOCKED_TEMPORARY`/`LOCKED_PERMANENT`), Locked At, Locked Until, Lockout History Count (penghitung kumulatif seumur hidup untuk eskalasi lockout; tidak pernah direset), Password History (koleksi entity).
 
 ### Aggregate 3: `MFAFactor`
 Melindungi invarian: faktor dalam status `PENDING` tidak dapat digunakan untuk verifikasi; recovery code bersifat sekali pakai dan harus ditandai terpakai secara atomik.
@@ -467,6 +469,13 @@ Dua mode penguncian:
 - **Permanent Lockout:** Terkunci tanpa batas waktu; memerlukan administrator untuk membukanya
 
 Kebijakan eskalasi (dapat dikonfigurasi): Lockout pertama → Temporary (30 menit); Kedua → Temporary (2 jam); Ketiga → Permanent.
+
+Tingkat eskalasi ditentukan oleh `lockout_history_count` pada kredensial:
+- Diinisialisasi `0` saat kredensial dibuat dan dinaikkan 1 setiap kali lockout baru terpicu (apa pun tingkatnya)
+- **Tidak pernah direset** — baik saat Temporary Lockout berakhir otomatis maupun saat dibuka oleh administrator; ini adalah penghitung kumulatif seumur hidup
+- Tingkat dipilih berdasarkan nilai **sebelum** dinaikkan: `0` → Temporary 30 menit; `1` → Temporary 2 jam; `>= 2` → Permanent
+
+Saat kunci dibuka (otomatis setelah `locked_until` terlewati, atau oleh administrator), `failed_attempt_count` direset ke `0` dan domain event `AccountUnlocked` dipancarkan (lihat US-003).
 
 **FR-LOGIN-005: Audit Login**
 Setiap percobaan login (berhasil maupun gagal) harus dipersistensi sebagai catatan `LoginAttempt` yang berisi: identity_id, company_code_used, username_used, timestamp, outcome, failure_reason, ip_address, user_agent, device_fingerprint, session_id (bila berhasil).
@@ -600,6 +609,9 @@ Default: 90 hari (bank admin), 180 hari (pengguna korporasi). Peringatan pada 14
 
 **FR-PWD-007: Reset Kata Sandi yang Diprakarsai Admin**
 Administrator dapat memaksa reset kata sandi untuk identitas mana pun. Pengguna harus menetapkan kata sandi baru pada login berikutnya.
+- Menetapkan `force_password_change = TRUE`; kata sandi saat ini tetap dapat dipakai untuk login (US-007)
+- Memancarkan `AdminInitiatedPasswordReset` (sekali; tindakan berulang saat flag sudah aktif tidak memancarkan event baru)
+- Perubahan kata sandi berikutnya memancarkan `PasswordChanged` dengan `change_type = FORCED`
 
 ## 8.6 Manajemen Token
 
@@ -1000,6 +1012,7 @@ CREATE TABLE credentials (
     lockout_status        VARCHAR(32) NOT NULL DEFAULT 'UNLOCKED',
     locked_at             TIMESTAMPTZ,
     locked_until          TIMESTAMPTZ,
+    lockout_history_count INT NOT NULL DEFAULT 0, -- kumulatif seumur hidup; tidak pernah direset (FR-LOGIN-004)
     created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -1016,6 +1029,7 @@ CREATE TABLE password_history (
     password_hash  VARCHAR(255) NOT NULL,
     password_salt  VARCHAR(64) NOT NULL,
     algorithm      VARCHAR(32) NOT NULL,
+    password_version INT NOT NULL DEFAULT 1,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX idx_password_history_credential ON password_history(credential_id, created_at DESC);
@@ -1324,6 +1338,8 @@ Alasan kegagalan: `INVALID_CREDENTIALS`, `ACCOUNT_LOCKED`, `ACCOUNT_NOT_FOUND`, 
 }
 ```
 
+Nilai `lockout_type`: `TEMPORARY`, `PERMANENT` (`locked_until` bernilai null). Ini adalah kontrak event publik; secara internal domain memakai `lockout_status` (`LOCKED_TEMPORARY`/`LOCKED_PERMANENT`) dan pemetaan `LOCKED_TEMPORARY → TEMPORARY`, `LOCKED_PERMANENT → PERMANENT` dilakukan saat event diserialisasi ke outbox — bukan di dalam domain.
+
 ## 13.4 SessionCreated
 
 **Makna Bisnis:** Sesi autentikasi terverifikasi yang baru telah dibentuk.
@@ -1376,6 +1392,8 @@ Alasan pencabutan: `USER_LOGOUT`, `ADMIN_FORCE_LOGOUT`, `PASSWORD_CHANGED`, `PAS
   "occurred_at": "2026-06-30T10:00:00Z"
 }
 ```
+
+Tipe perubahan: `USER_INITIATED` (perubahan sukarela), `FORCED` (saat `force_password_change` aktif akibat `AdminInitiatedPasswordReset`, atau kata sandi telah kedaluwarsa).
 
 ## 13.7 PasswordResetRequested
 
@@ -1470,6 +1488,37 @@ Alasan pencabutan: `USER_LOGOUT`, `ADMIN_FORCE_LOGOUT`, `PASSWORD_CHANGED`, `PAS
   "suspicious_ip": "198.51.100.42",
   "tokens_revoked_count": 4,
   "occurred_at": "2026-06-30T11:00:00Z"
+}
+```
+
+## 13.15 AccountUnlocked
+
+**Makna Bisnis:** Penguncian kredensial suatu identitas telah dicabut — baik otomatis karena Temporary Lockout berakhir, maupun oleh administrator (command `UnlockAccount`). Principal dapat kembali melakukan autentikasi.
+**Produsen:** CredentialAggregate
+**Konsumen:** Audit, Fraud/Risk
+
+```json
+{
+  "identity_id": "identity_01H9XZ...",
+  "unlocked_by": "identity_admin01...",
+  "previous_lockout_type": "PERMANENT",
+  "occurred_at": "2026-06-30T12:00:00Z"
+}
+```
+
+`unlocked_by` bernilai null untuk pembukaan otomatis; `occurred_at` untuk pembukaan otomatis adalah nilai `locked_until` (momen kunci benar-benar berakhir), bukan waktu terdeteksinya. `lockout_history_count` tidak berubah oleh pembukaan kunci. `previous_lockout_type` memakai nilai dan pemetaan yang sama dengan `lockout_type` pada AccountLocked (§13.3).
+
+## 13.16 AdminInitiatedPasswordReset
+
+**Makna Bisnis:** Administrator mewajibkan suatu identitas mengganti kata sandinya pada login berikutnya (FR-PWD-007). Kata sandi saat ini belum dibatalkan.
+**Produsen:** CredentialAggregate
+**Konsumen:** Audit, Notification
+
+```json
+{
+  "identity_id": "identity_01H9XZ...",
+  "initiated_by": "identity_admin01...",
+  "occurred_at": "2026-06-30T12:00:00Z"
 }
 ```
 
