@@ -765,8 +765,8 @@ Hexagonal Architecture (Ports and Adapters) + Clean Architecture. Microservice y
 
 | Lapisan | Teknologi | Alasan |
 |---|---|---|
-| Runtime | JVM (Java 21 LTS) atau Go 1.22+ | JVM: ekosistem keamanan/kriptografi yang kaya; Go: performa, memori rendah |
-| Framework | Spring Boot 3 (Java) atau stdlib/chi (Go) | Spring Boot untuk JVM; chi untuk minimalisme Go |
+| Runtime | Go 1.22+ | Performa tinggi, penggunaan memori rendah, deployment sebagai binary statis tunggal |
+| Framework | stdlib / chi | Overhead minimal, kontrol eksplisit atas middleware dan routing |
 | Basis Data | PostgreSQL 16 | Kepatuhan ACID, ekstensi enkripsi yang kuat |
 | Cache / Sesi | Redis 7 (Cluster) | Validasi token dan daftar pencabutan berlatensi rendah |
 | Message Broker | Apache Kafka | Pengiriman domain event yang durabel dan terurut |

@@ -734,8 +734,8 @@ Hexagonal Architecture (Ports and Adapters) + Clean Architecture. Independently 
 
 | Layer | Technology | Rationale |
 |---|---|---|
-| Runtime | JVM (Java 21 LTS) or Go 1.22+ | JVM: rich security/crypto ecosystem; Go: performance, low memory |
-| Framework | Spring Boot 3 (Java) or stdlib/chi (Go) | Spring Boot for JVM; chi for Go minimalism |
+| Runtime | Go 1.22+ | Performance, low memory footprint, single static binary deployment |
+| Framework | stdlib / chi | Minimal overhead, explicit control over middleware and routing |
 | Database | PostgreSQL 16 | ACID compliance, strong encryption extensions |
 | Cache / Session | Redis 7 (Cluster) | Low-latency token validation and revocation list |
 | Message Broker | Apache Kafka | Durable, ordered domain event delivery |
