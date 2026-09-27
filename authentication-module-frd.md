@@ -161,14 +161,42 @@ An external system within the platform that may send inbound commands to the Aut
 ## 4.1 Standard Login Flow
 
 ### FR-LOGIN-001: Login Endpoint Acceptance
-The system SHALL accept login requests at `POST /api/v1/auth/login` with the following inputs:
+
+The system SHALL accept login requests at three distinct endpoints, one per calling client, each with a different mechanism for establishing which client is calling:
+
+| Endpoint | Caller | Client identity established via |
+|---|---|---|
+| `POST /api/v1/auth/login` | Corporate Portal BFF (Go service, deployed in-mesh) | Istio mTLS peer identity (SPIFFE ID), enforced by `AuthorizationPolicy` — see FR-LOGIN-001a. No `client_id` field accepted. |
+| `POST /api/v1/auth/admin/login` | Bank Administration Portal BFF (Go service, deployed in-mesh) | Istio mTLS peer identity (SPIFFE ID), enforced by `AuthorizationPolicy` — see FR-LOGIN-001a. No `client_id` field accepted. |
+| `POST /api/v1/auth/mobile/login` | Mobile Approval native app (public client, outside the mesh) | Self-declared `client_id` field — unauthenticated; see BR-013 for the resulting constraint on what this field may be used for. |
+
+Splitting the endpoint this way removes the need for a self-declared `client_id` on the two BFF-mediated paths: the calling application is already established by the mesh before the request reaches this module's business logic, so trusting an additional client-supplied field there would only reintroduce the ambiguity the split is meant to remove.
+
+**Common request fields (all three endpoints):**
 
 | Field | Type | Required | Validation |
 |---|---|---|---|
 | `identifier` | string | Yes | 3–256 characters; trimmed of leading/trailing whitespace |
 | `password` | string | Yes | 1–128 characters (max enforced to prevent DoS on hash computation) |
-| `client_id` | string | Yes | Must match a registered OAuth2 client |
 | `device_fingerprint` | object | No | See Device Fingerprint specification (Section 4.6) |
+
+**Additional field, `POST /api/v1/auth/mobile/login` only:**
+
+| Field | Type | Required | Validation |
+|---|---|---|---|
+| `client_id` | string | Yes | Must match the registered OAuth2 client for the Mobile Approval application |
+
+### FR-LOGIN-001a: BFF Caller Verification (Istio AuthorizationPolicy)
+
+`POST /api/v1/auth/login` and `POST /api/v1/auth/admin/login` are restricted at the service mesh layer, not by anything in the request body:
+
+1. The Corporate Portal BFF and the Bank Administration Portal BFF are Go services deployed in the same Kubernetes cluster / Istio mesh as the Authentication Service — no external PKI or bespoke certificate issuance is required.
+2. Istio issues each workload a SPIFFE identity and enforces `PeerAuthentication: STRICT` mTLS mesh-wide (§16.12 Zero Trust) — this reuses the trust model already adopted for all other inter-service traffic.
+3. An `AuthorizationPolicy` on the Authentication Service restricts each route to exactly one expected peer principal:
+   - `/api/v1/auth/login` ← `spiffe://cluster.local/ns/corporate-portal/sa/bff` only.
+   - `/api/v1/auth/admin/login` ← `spiffe://cluster.local/ns/bank-admin/sa/bff` only.
+4. A request reaching either endpoint from any other peer identity SHALL be rejected by the mesh before it reaches the Authentication Service's application code.
+5. The Authentication Service reads the verified peer principal (via the mesh-injected `X-Forwarded-Client-Cert` header or equivalent Istio-provided request context) as the trusted client identity for this request. This identity — not a request body field — is what FR-LOGIN-012 (concurrent session policy) and FR-SESSION-002 (JWT `aud` claim) key off for these two endpoints.
 
 ### FR-LOGIN-002: Identifier Resolution
 The system SHALL resolve the submitted `identifier` to an internal `identity_id` using the following lookup order:
@@ -315,15 +343,15 @@ If the MFA session token has expired when the user submits a code:
 
 ### FR-LOGIN-012: Concurrent Session Policy Enforcement
 
-On successful authentication (after all factors verified), before creating a new session, the system SHALL enforce the concurrent session policy configured for the `client_id`:
+On successful authentication (after all factors verified), before creating a new session, the system SHALL enforce the concurrent session policy configured for the calling client — identified per FR-LOGIN-001 (the mesh-verified peer identity for `/auth/login` and `/auth/admin/login`; the submitted `client_id` for `/auth/mobile/login`):
 
 | Policy | Behavior |
 |---|---|
 | `ALLOW_ALL` | Create new session without any action on existing sessions |
-| `LIMIT_N` | Count active sessions for identity + client_id. If count >= N, revoke the oldest session (by `created_at`). Then create new session. |
-| `SINGLE` | Revoke all existing active sessions for identity + client_id. Then create new session. |
+| `LIMIT_N` | Count active sessions for identity + client. If count >= N, revoke the oldest session (by `created_at`). Then create new session. |
+| `SINGLE` | Revoke all existing active sessions for identity + client. Then create new session. |
 
-Default policy: `ALLOW_ALL` for API clients; `LIMIT_N` (N=5) for web portal clients.
+Default policy: `ALLOW_ALL` for API clients; `LIMIT_N` (N=5) for web portal clients (Corporate Portal, Bank Administration Portal).
 
 ---
 
@@ -459,8 +487,10 @@ On successful authentication, the system SHALL return:
 ```
 
 The `refresh_token` SHALL be delivered:
-- In the JSON body for mobile/API clients
-- Additionally as an `HttpOnly; Secure; SameSite=Strict` cookie named `__Secure-refresh_token` for web browser clients (detected by `client_id` type or explicit `delivery_method` parameter)
+- In the JSON body for `/auth/mobile/login` and Public API clients
+- Additionally as an `HttpOnly; Secure; SameSite=Strict` cookie named `__Secure-refresh_token` for requests authenticated via `/auth/login` or `/auth/admin/login` — detected by which endpoint issued the token (FR-LOGIN-001), not a client-supplied field.
+
+**Open question (out of scope of this revision):** since `/auth/login` and `/auth/admin/login` are now called by each portal's own BFF rather than directly by the end user's browser, the BFF — not the Authentication Service — is what sits in front of the browser. Whether the BFF transparently forwards this `Set-Cookie` to the browser, or instead mints its own opaque session cookie and keeps the refresh token server-side, is a BFF-side design decision to be specified separately.
 
 ---
 
@@ -589,24 +619,35 @@ MFA enrollment SHALL only be available to authenticated users (valid Access Toke
 
 ### FR-MFA-ENROLL-006: OTP MFA — No Explicit Enrollment
 
-SMS OTP does not require explicit enrollment by the user. The user's phone number is sourced from the Identity Context. If no phone number is registered in the Identity Context, SMS OTP is unavailable as a factor.
+OTP (SMS or WhatsApp) does not require explicit enrollment by the user. The user's phone number is sourced from the Identity Context and used for both delivery channels. If no phone number is registered in the Identity Context, OTP is unavailable as a factor (neither channel).
 
-The system SHALL query the Identity Context at MFA challenge time to determine whether SMS OTP is available for the user. The Identity Context returns a masked phone number (e.g., `+62-***-****-7890`) for display.
+The system SHALL query the Identity Context at MFA challenge time to determine whether OTP is available for the user. The Identity Context returns a masked phone number (e.g., `+62-***-****-7890`) for display, shared by both the SMS and WhatsApp delivery endpoints.
 
 ### FR-MFA-ENROLL-007: OTP Delivery
 
-When SMS OTP is selected as the MFA factor during login:
+The `SMS_OTP` factor's code can be delivered via two channels, each with its own endpoint. Both endpoints produce and validate the *same* underlying OTP credential — the delivery channel is a user-facing convenience choice, not a distinct MFA factor. `POST /api/v1/auth/mfa/verify` therefore continues to accept `factor_type: "SMS_OTP"` regardless of which endpoint delivered the code (see FR-MFA-VERIFY-003).
 
-1. Generate a 6-digit cryptographically random numeric code (not using `Math.random()` or equivalent non-CSPRNG sources).
-2. Compute SHA-256 hash of the code.
-3. Store in `mfa_pending_otps`:
+`POST /api/v1/auth/mfa/otp/sms` — deliver the code via SMS.
+`POST /api/v1/auth/mfa/otp/wa` — deliver the code via WhatsApp (Notification Context's WhatsApp Business API integration).
+
+**Request (both endpoints):** `{ "mfa_session_token": "..." }`
+
+**Processing (both endpoints, identical except for delivery channel):**
+
+1. Retrieve `mfa_session_token` state from Redis. If not found or expired → ERR-MFA-004.
+2. Query the Identity Context for a registered phone number. If none registered → ERR-MFA-011 (OTP channel unavailable).
+3. Rate limit check: if 3 OTP send requests (combined across `/otp/sms` and `/otp/wa` — same counter, keyed by `identity_id`) have been made in the last 10 minutes → return ERR-MFA-008 (too many OTP requests). Do not generate a new OTP. This shared counter prevents bypassing the limit by alternating channels.
+4. Generate a 6-digit cryptographically random numeric code (not using `Math.random()` or equivalent non-CSPRNG sources).
+5. Compute SHA-256 hash of the code.
+6. Upsert in `mfa_pending_otps` for this `identity_id` + `purpose = MFA_VERIFICATION` (replacing/invalidating any still-pending OTP from either channel — only the most recently sent code is valid):
    - `identity_id`
    - `otp_hash` = SHA-256 of raw code
    - `purpose = MFA_VERIFICATION`
+   - `channel` = `SMS` or `WHATSAPP` (for audit/delivery-log purposes only; does not affect verification)
    - `expires_at = NOW() + 300 seconds`
    - `attempt_count = 0`
-4. Publish `OTPRequested` internal event → Notification Context delivers the raw OTP code via SMS.
-5. Rate limit: if 3 OTP send requests have been made in the last 10 minutes for this identity, return ERR-MFA-008 (too many OTP requests). Do not generate a new OTP.
+7. Publish `OTPRequested` internal event with the selected channel → Notification Context delivers the raw OTP code via SMS or WhatsApp accordingly.
+8. Return 204 No Content on success.
 
 ---
 
@@ -679,7 +720,7 @@ Immediately after all authentication factors are verified, the system SHALL crea
    - `mfa_factors_used` = JSON array of factor IDs used
    - `created_at = NOW()`
    - `last_activity_at = NOW()`
-   - `idle_timeout_secs` = configured policy for the `client_id`
+   - `idle_timeout_secs` = configured policy for the calling client (per FR-LOGIN-001: mesh-verified peer identity for `/auth/login`/`/auth/admin/login`, or `client_id` for `/auth/mobile/login`)
    - `absolute_expires_at = NOW() + absolute_session_duration` (configured policy)
    - `creation_ip` = client IP
    - `creation_user_agent` = User-Agent header
@@ -695,7 +736,7 @@ Claims construction:
 {
   "iss": <configured_issuer_url>,
   "sub": <identity_id>,
-  "aud": [<client_id>, <additional_audiences_from_config>],
+  "aud": [<resolved_client_identity>, <additional_audiences_from_config>],
   "iat": <now_unix_timestamp>,
   "exp": <now + access_token_ttl>,
   "jti": <UUID v4 — unique token ID>,
@@ -703,9 +744,11 @@ Claims construction:
   "aal": <AAL1|AAL2|AAL3>,
   "device_id": <device_id>,
   "corporate_id": <corporate_id from Identity Context, if applicable>,
-  "scope": <space-separated OAuth2 scopes granted to client_id>
+  "scope": <space-separated OAuth2 scopes granted to the resolved client>
 }
 ```
+
+`<resolved_client_identity>` is set by the Authentication Service itself, never copied verbatim from a request field: for `/auth/login` and `/auth/admin/login` it is the mesh-verified SPIFFE peer identity mapped to its canonical client label (FR-LOGIN-001a); for `/auth/mobile/login` it is the submitted `client_id` (see BR-013 — this is why `aud` for mobile-issued tokens carries lower assurance than for BFF-issued tokens, until the mobile path is hardened per §16.5/attestation).
 
 Signing:
 - Sign with the current active RSA private key using RS256.
@@ -721,7 +764,7 @@ Simultaneously with Access Token issuance:
 4. Create `refresh_tokens` record:
    - `token_hash`
    - `status = ACTIVE`
-   - `client_id`
+   - `client_id` (the resolved client identity — mesh-verified peer identity for `/auth/login`/`/auth/admin/login`, submitted `client_id` for `/auth/mobile/login`; see FR-LOGIN-001)
    - `issued_at = NOW()`
    - `expires_at = NOW() + refresh_token_ttl` (policy-based; default: 24h web, 7d mobile)
    - `issuer_ip`
@@ -1153,6 +1196,65 @@ Client authentication: `Authorization: Basic {base64(client_id:client_secret)}`.
 
 **Response time SLA:** P95 < 50ms. Introspection is on the critical path of every authenticated API call.
 
+### FR-TOKEN-004a: Token Introspection — gRPC Contract
+
+Introspection is additionally exposed as a gRPC RPC, as a lower-latency alternative to `POST /api/v1/auth/token/introspect` for Resource Server clients running inside the Istio service mesh. Both transports invoke the same Application Layer use case (FR-TOKEN-004, steps 1–9) — there is exactly one introspection business rule, with two Primary Adapters (see PRD §10.1 Architectural Style: REST API and gRPC are both already listed as Inbound Adapters in the hexagonal architecture diagram). This is additive: the REST endpoint is not deprecated and remains the RFC 7662-compliant contract for any consumer that needs it.
+
+**Proto contract** (`proto/auth/v1/introspection.proto`):
+
+```protobuf
+syntax = "proto3";
+
+package auth.v1;
+
+option go_package = "github.com/bank/auth-service/pkg/pb/authv1";
+
+// Called by trusted Resource Server / API Gateway clients over the
+// Istio mesh. Semantically equivalent to POST /api/v1/auth/token/introspect
+// (RFC 7662) — see FR-TOKEN-004 for the underlying validation steps.
+service TokenIntrospectionService {
+  rpc Introspect(IntrospectRequest) returns (IntrospectResponse);
+}
+
+message IntrospectRequest {
+  string token = 1; // Required. The Access Token (JWT) to validate.
+}
+
+message IntrospectResponse {
+  bool active = 1;
+
+  // Populated only when active = true. Mirrors the REST introspection
+  // response's claim set — see FR-TOKEN-004 step 9.
+  string sub = 2;             // identity_id
+  string session_id = 3;
+  string aal = 4;
+  string device_id = 5;
+  string corporate_id = 6;
+  repeated string scope = 7;
+  string jti = 8;
+  int64 exp = 9;
+  int64 iat = 10;
+  repeated string aud = 11;
+}
+```
+
+**Client authentication:** Unlike the REST endpoint (`Authorization: Basic {client_id:client_secret}`, FR-TOKEN-004), the gRPC path authenticates the caller via its **mTLS peer identity issued by the Istio mesh** (SPIFFE ID), not a shared secret in the call payload — this is the idiomatic mechanism already used for all inter-service traffic (PRD §16.12 Zero Trust; PRD §10.2 Technology Stack lists Istio as the Service Mesh). A server-side interceptor verifies the peer's SPIFFE ID against the registered Resource Server client allowlist before invoking the use case. If the peer identity is not registered → `UNAUTHENTICATED`.
+
+**Request validation:** An empty or missing `token` field → `INVALID_ARGUMENT`. This is the only input-validation failure; it is distinct from an *invalid token value*, which — consistent with FR-TOKEN-004's uniform `{ "active": false }` behavior — is never surfaced as a distinguishable error. A malformed, expired, or revoked token all collapse to `active: false` with no further detail, over gRPC exactly as over REST, so a caller cannot learn *why* a token is inactive.
+
+**Status code mapping** (gRPC status, not the REST `code`/`code_client` envelope — see note below):
+
+| Condition | gRPC Status |
+|---|---|
+| Success (regardless of `active` true/false) | `OK` |
+| Caller's mTLS peer identity not a registered Resource Server client | `UNAUTHENTICATED` |
+| `token` field empty/missing | `INVALID_ARGUMENT` |
+| Downstream dependency (Redis/DB) unavailable | `UNAVAILABLE` |
+
+**Note on `code`/`code_client`:** The `code`/`code_client` envelope (§13.9) exists to tell a **web/mobile UI** what post-error action to take. Introspection has no end-user-facing UI on the other end of the call — its only caller is a backend Resource Server making its own authorization decision — so neither the REST nor the gRPC introspection response carries `code`/`code_client`; gRPC status codes (and the REST endpoint's real HTTP status) are sufficient and are the idiomatic signal for a machine-to-machine contract.
+
+**Response time SLA:** Same as FR-TOKEN-004 (P95 < 50ms) — the gRPC path exists specifically to make this easier to sustain at high call volume via HTTP/2 connection reuse and protobuf's lower serialization cost versus JSON.
+
 ---
 
 ## 9.2 Refresh Token Lifecycle
@@ -1162,7 +1264,7 @@ Client authentication: `Authorization: Basic {base64(client_id:client_secret)}`.
 `POST /api/v1/auth/token/refresh`
 
 1. Parse `refresh_token` from request body.
-2. Parse `client_id` from request body or `Authorization: Basic` header.
+2. Resolve the calling client identity: the mesh-verified peer identity (FR-LOGIN-001a) if the caller is the Corporate Portal BFF or Bank Administration Portal BFF; otherwise, the submitted `client_id` field (Mobile Approval — see BR-013).
 3. Compute `token_hash = SHA-256(refresh_token)`.
 4. Look up `refresh_tokens` by `token_hash`.
 
@@ -1183,7 +1285,7 @@ Client authentication: `Authorization: Basic {base64(client_id:client_secret)}`.
 
 **Case D — Token status is `ACTIVE`:**
 1. Verify `expires_at > NOW()`. If expired → set status `EXPIRED`; return ERR-TOKEN-002.
-2. Verify `client_id` matches the token's stored `client_id`.
+2. Verify the resolved client identity (step 2 above) matches the token's stored `client_id`.
 3. Load associated `refresh_token_families`. Verify family `status = ACTIVE`.
 4. Load associated session. Verify session `status = ACTIVE`.
 5. Evaluate session idle timeout and absolute timeout (FR-SESSION-004). If session expired → ERR-SESSION-002.
@@ -1314,7 +1416,8 @@ MFA is required for a login attempt if ANY of the following conditions are true:
 | Condition | Source |
 |---|---|
 | Corporate policy requires MFA for all users of this corporate | Corporate Context policy cache |
-| The `client_id` configuration requires MFA (e.g., Bank Admin Portal) | Authentication Module config |
+| The identity is flagged as a Bank Administrator | Identity Context (identity's own role/segment — see BR-013) |
+| The request was authenticated via `POST /api/v1/auth/admin/login` | Mesh-verified endpoint (FR-LOGIN-001a) — redundant with the row above by design; see BR-013 |
 | The user has voluntarily enrolled MFA and it is active | Checked against `mfa_factors` |
 | The risk score for this login attempt is >= 31 (medium) | Risk evaluation engine |
 | The device is unrecognized (new device fingerprint) | Device lookup result |
@@ -1366,6 +1469,14 @@ If `force_password_change = TRUE` on a credential, the forced change session tok
 
 Once a device's `trust_status` is set to `REVOKED`, it cannot be re-registered using the same fingerprint. The user must use a new device or the same physical device will generate a new fingerprint (which will be registered as a new device). This is intentional — a revoked device is considered compromised.
 
+## BR-013: Self-Declared Client Identity Is Never a Sole Security Control
+
+The `client_id` field submitted on `POST /api/v1/auth/mobile/login` (FR-LOGIN-001) is unauthenticated — any caller reaching that public endpoint can set it to any registered value. The system SHALL NOT make a security-sensitive decision (mandatory MFA, concurrent session policy, JWT `aud` trust) based on that field alone.
+
+- On `POST /api/v1/auth/login` and `POST /api/v1/auth/admin/login`, the client identity used for such decisions SHALL come from the mesh-verified peer identity (FR-LOGIN-001a), never from a request body field — these two endpoints do not accept a `client_id` field at all.
+- On `POST /api/v1/auth/mobile/login`, mandatory-MFA and session-policy decisions SHALL be evaluated from the resolved identity's own role/segment in the Identity Context (e.g., "is this identity a Bank Administrator") wherever such a role exists, rather than from the submitted `client_id` — this is what BR-003's identity-flag condition provides. `client_id` on this endpoint remains usable for non-security bookkeeping (refresh token TTL policy, JWT `aud` labeling, audit/analytics) where a spoofed value has no security consequence, and as an input to the Client Credentials-authenticated System Actor flows (which are unaffected by this rule — see Actor Definitions, API Client (Machine)).
+- This is a defense-in-depth rule, not a replacement for FR-LOGIN-001a: a Bank Administrator identity requiring MFA regardless of which endpoint authenticated them (BR-003) protects against future misconfiguration (e.g., a new client being added without a corresponding `AuthorizationPolicy`), not just against today's known endpoints.
+
 ---
 
 ---
@@ -1376,10 +1487,10 @@ Once a device's `trust_status` is set to `REVOKED`, it cannot be re-registered u
 
 | Rule | Details |
 |---|---|
-| Content-Type | All POST/PATCH/PUT requests MUST include `Content-Type: application/json`. Requests without this header SHALL be rejected with 415 Unsupported Media Type. |
-| Request body size | Maximum 64KB. Requests exceeding this SHALL be rejected with 413 Payload Too Large. |
-| Character encoding | All inputs MUST be valid UTF-8. Invalid UTF-8 sequences SHALL be rejected with 400. |
-| Null bytes | Null bytes (0x00) in any string input SHALL be rejected with 400. |
+| Content-Type | All POST/PATCH/PUT requests MUST include `Content-Type: application/json`. Requests without this header SHALL be rejected with HTTP 200 and `code: ERR-REQUEST-004`. |
+| Request body size | Maximum 64KB. Requests exceeding this SHALL be rejected with HTTP 200 and `code: ERR-REQUEST-005`. |
+| Character encoding | All inputs MUST be valid UTF-8. Invalid UTF-8 sequences SHALL be rejected with HTTP 200 and `code: ERR-REQUEST-001`. |
+| Null bytes | Null bytes (0x00) in any string input SHALL be rejected with HTTP 200 and `code: ERR-REQUEST-002`. |
 | SQL/NoSQL injection | Not applicable — all database queries use parameterized statements. This is an implementation constraint, not a validation rule. |
 
 ## 12.2 Field-Level Validation
@@ -1414,6 +1525,7 @@ Once a device's `trust_status` is set to `REVOKED`, it cannot be re-registered u
 - Case-insensitive (normalize to uppercase before comparison)
 
 ### client_id
+Applies only to `POST /api/v1/auth/mobile/login` and the OAuth2 Client Credentials flow (Public API). Not accepted on `POST /api/v1/auth/login` or `POST /api/v1/auth/admin/login` — see FR-LOGIN-001 and BR-013.
 - Type: string
 - Max length: 128 characters
 - Allowed characters: alphanumeric, hyphen, underscore
@@ -1432,75 +1544,86 @@ Once a device's `trust_status` is set to `REVOKED`, it cannot be re-registered u
 
 # 13. Error Catalog
 
-All errors follow RFC 7807 format with a machine-readable `type` URI, `title`, `status`, and `detail`.
+All errors follow RFC 7807 format with a machine-readable `type` URI, `title`, and `detail`. The `status` field is dropped from the envelope — HTTP transport status is 200 for all business-logic errors. Only two token/session errors verified via API gateway introspection (`ERR-SESSION-002`, `ERR-TOKEN-004`), the rate-limiting family (429), and system errors (>=500) keep their real HTTP status; everything else, including 404-shaped "not found" business errors, is transported as HTTP 200. Every response body — success or error — carries top-level `code` and `code_client` fields (§13.9); on success, both are `"00"`.
+
+## 13.0 Generic Request Errors
+
+| Code | HTTP Status | Type URI Suffix | Detail |
+|---|---|---|---|
+| ERR-REQUEST-001 | 200 | `/errors/invalid-encoding` | Invalid UTF-8 sequence in request body. |
+| ERR-REQUEST-002 | 200 | `/errors/null-byte-input` | Null byte (0x00) detected in a string input. |
+| ERR-REQUEST-003 | 200 | `/errors/invalid-request-body` | The request body is malformed or violates the expected schema. |
+| ERR-REQUEST-004 | 200 | `/errors/unsupported-media-type` | `Content-Type: application/json` header is required. |
+| ERR-REQUEST-005 | 200 | `/errors/payload-too-large` | Request body exceeds the maximum size of 64KB. |
 
 ## 13.1 Login Errors
 
 | Code | HTTP Status | Type URI Suffix | Detail |
 |---|---|---|---|
-| ERR-LOGIN-001 | 401 | `/errors/invalid-credentials` | The provided credentials are incorrect. |
-| ERR-LOGIN-002 | 401 | `/errors/identity-inactive` | The account is not available. (Same as ERR-LOGIN-001 — response must be indistinguishable) |
-| ERR-LOGIN-003 | 423 | `/errors/account-locked` | Account is locked. Includes `locked_until` for temporary locks. |
-| ERR-LOGIN-004 | 401 | `/errors/mfa-session-invalid` | MFA session token is invalid or expired. |
-| ERR-LOGIN-005 | 403 | `/errors/password-change-required` | Password change is required before access is granted. |
+| ERR-LOGIN-001 | 200 | `/errors/invalid-credentials` | The provided credentials are incorrect. |
+| ERR-LOGIN-002 | 200 | `/errors/identity-inactive` | The account is not available. (Same as ERR-LOGIN-001 — response must be indistinguishable) |
+| ERR-LOGIN-003 | 200 | `/errors/account-locked` | Account is locked. Includes `locked_until` for temporary locks. |
+| ERR-LOGIN-004 | 200 | `/errors/mfa-session-invalid` | MFA session token is invalid or expired. |
+| ERR-LOGIN-005 | 200 | `/errors/password-change-required` | Password change is required before access is granted. |
 
 ## 13.2 MFA Errors
 
 | Code | HTTP Status | Type URI Suffix | Detail |
 |---|---|---|---|
-| ERR-MFA-001 | 401 | `/errors/invalid-mfa-code` | The submitted MFA code is incorrect. |
-| ERR-MFA-002 | 401 | `/errors/mfa-code-already-used` | This MFA code has already been used. |
-| ERR-MFA-003 | 409 | `/errors/mfa-factor-not-found` | The specified MFA factor does not exist or is not active. |
-| ERR-MFA-004 | 401 | `/errors/mfa-session-expired` | MFA session has expired. Please restart the login process. |
-| ERR-MFA-005 | 422 | `/errors/otp-not-requested` | No OTP has been requested or the OTP has expired. |
+| ERR-MFA-001 | 200 | `/errors/invalid-mfa-code` | The submitted MFA code is incorrect. |
+| ERR-MFA-002 | 200 | `/errors/mfa-code-already-used` | This MFA code has already been used. |
+| ERR-MFA-003 | 200 | `/errors/mfa-factor-not-found` | The specified MFA factor does not exist or is not active. |
+| ERR-MFA-004 | 200 | `/errors/mfa-session-expired` | MFA session has expired. Please restart the login process. |
+| ERR-MFA-005 | 200 | `/errors/otp-not-requested` | No OTP has been requested or the OTP has expired. |
 | ERR-MFA-006 | 429 | `/errors/otp-max-attempts` | Too many incorrect OTP attempts. Please request a new OTP. |
-| ERR-MFA-007 | 401 | `/errors/fido2-counter-invalid` | Authenticator counter is invalid. Device may be cloned. |
+| ERR-MFA-007 | 200 | `/errors/fido2-counter-invalid` | Authenticator counter is invalid. Device may be cloned. |
 | ERR-MFA-008 | 429 | `/errors/otp-rate-limited` | Too many OTP requests. Please wait before requesting another. Includes `retry_after`. |
-| ERR-MFA-009 | 409 | `/errors/factor-already-enrolled` | An MFA factor of this type is already active. |
-| ERR-MFA-010 | 409 | `/errors/last-mandatory-factor` | Cannot disable the last active MFA factor when MFA is mandatory. |
+| ERR-MFA-009 | 200 | `/errors/factor-already-enrolled` | An MFA factor of this type is already active. |
+| ERR-MFA-010 | 200 | `/errors/last-mandatory-factor` | Cannot disable the last active MFA factor when MFA is mandatory. |
+| ERR-MFA-011 | 200 | `/errors/otp-channel-unavailable` | No phone number is registered for this account; SMS/WhatsApp OTP delivery is unavailable. |
 
 ## 13.3 Enrollment Errors
 
 | Code | HTTP Status | Type URI Suffix | Detail |
 |---|---|---|---|
-| ERR-MFA-ENROLL-001 | 410 | `/errors/enrollment-expired` | The enrollment session has expired. Please restart enrollment. |
+| ERR-MFA-ENROLL-001 | 200 | `/errors/enrollment-expired` | The enrollment session has expired. Please restart enrollment. |
 | ERR-MFA-ENROLL-002 | 429 | `/errors/enrollment-max-attempts` | Too many incorrect confirmation codes. Please restart enrollment. |
 
 ## 13.4 Token Errors
 
 | Code | HTTP Status | Type URI Suffix | Detail |
 |---|---|---|---|
-| ERR-TOKEN-001 | 401 | `/errors/invalid-refresh-token` | The refresh token is invalid. |
-| ERR-TOKEN-002 | 401 | `/errors/refresh-token-expired` | The refresh token has expired or been revoked. |
-| ERR-TOKEN-003 | 401 | `/errors/token-reuse-detected` | A security anomaly was detected. All sessions have been revoked. |
-| ERR-TOKEN-004 | 401 | `/errors/access-token-revoked` | The access token has been revoked. |
-| ERR-TOKEN-005 | 400 | `/errors/invalid-token-format` | The submitted token format is invalid. |
+| ERR-TOKEN-001 | 200 | `/errors/invalid-refresh-token` | The refresh token is invalid. |
+| ERR-TOKEN-002 | 200 | `/errors/refresh-token-expired` | The refresh token has expired or been revoked. |
+| ERR-TOKEN-003 | 200 | `/errors/token-reuse-detected` | A security anomaly was detected. All sessions have been revoked. |
+| ERR-TOKEN-004 | 401 | `/errors/access-token-revoked` | The access token has been revoked. Verified via API gateway token introspection (FR-TOKEN-004); real 401 preserved so gateway/session middleware can act without parsing a body. |
+| ERR-TOKEN-005 | 200 | `/errors/invalid-token-format` | The submitted token format is invalid. |
 
 ## 13.5 Session Errors
 
 | Code | HTTP Status | Type URI Suffix | Detail |
 |---|---|---|---|
-| ERR-SESSION-001 | 404 | `/errors/session-not-found` | The specified session does not exist. |
-| ERR-SESSION-002 | 401 | `/errors/session-expired` | The session has expired. Please log in again. |
-| ERR-SESSION-003 | 422 | `/errors/cannot-revoke-current-session` | Use POST /auth/logout to end the current session. |
+| ERR-SESSION-001 | 200 | `/errors/session-not-found` | The specified session does not exist. |
+| ERR-SESSION-002 | 401 | `/errors/session-expired` | The session has expired. Please log in again. Verified via API gateway token introspection (FR-TOKEN-004); real 401 preserved so gateway/session middleware can act without parsing a body. |
+| ERR-SESSION-003 | 200 | `/errors/cannot-revoke-current-session` | Use POST /auth/logout to end the current session. |
 
 ## 13.6 Password Errors
 
 | Code | HTTP Status | Type URI Suffix | Detail |
 |---|---|---|---|
-| ERR-PWD-001 | 422 | `/errors/password-too-long` | Password must not exceed 128 characters. |
-| ERR-PWD-002 | 422 | `/errors/password-too-short` | Password must be at least {min_length} characters. |
-| ERR-PWD-003 | 422 | `/errors/password-no-uppercase` | Password must contain at least one uppercase letter. |
-| ERR-PWD-004 | 422 | `/errors/password-no-lowercase` | Password must contain at least one lowercase letter. |
-| ERR-PWD-005 | 422 | `/errors/password-no-digit` | Password must contain at least one digit. |
-| ERR-PWD-006 | 422 | `/errors/password-no-special` | Password must contain at least one special character. |
-| ERR-PWD-007 | 422 | `/errors/password-contains-username` | Password must not contain your username. |
-| ERR-PWD-008 | 422 | `/errors/password-too-common` | This password is too common. Please choose a more unique password. |
-| ERR-PWD-009 | 422 | `/errors/password-previously-used` | This password has been used recently. Please choose a different password. |
-| ERR-PWD-010 | 401 | `/errors/current-password-incorrect` | The current password is incorrect. |
-| ERR-PWD-011 | 400 | `/errors/invalid-reset-token` | The password reset token is invalid or has expired. |
-| ERR-PWD-012 | 410 | `/errors/reset-token-used` | This password reset token has already been used. |
-| ERR-PWD-013 | 410 | `/errors/reset-token-expired` | This password reset token has expired. Please request a new one. |
+| ERR-PWD-001 | 200 | `/errors/password-too-long` | Password must not exceed 128 characters. |
+| ERR-PWD-002 | 200 | `/errors/password-too-short` | Password must be at least {min_length} characters. |
+| ERR-PWD-003 | 200 | `/errors/password-no-uppercase` | Password must contain at least one uppercase letter. |
+| ERR-PWD-004 | 200 | `/errors/password-no-lowercase` | Password must contain at least one lowercase letter. |
+| ERR-PWD-005 | 200 | `/errors/password-no-digit` | Password must contain at least one digit. |
+| ERR-PWD-006 | 200 | `/errors/password-no-special` | Password must contain at least one special character. |
+| ERR-PWD-007 | 200 | `/errors/password-contains-username` | Password must not contain your username. |
+| ERR-PWD-008 | 200 | `/errors/password-too-common` | This password is too common. Please choose a more unique password. |
+| ERR-PWD-009 | 200 | `/errors/password-previously-used` | This password has been used recently. Please choose a different password. |
+| ERR-PWD-010 | 200 | `/errors/current-password-incorrect` | The current password is incorrect. |
+| ERR-PWD-011 | 200 | `/errors/invalid-reset-token` | The password reset token is invalid or has expired. |
+| ERR-PWD-012 | 200 | `/errors/reset-token-used` | This password reset token has already been used. |
+| ERR-PWD-013 | 200 | `/errors/reset-token-expired` | This password reset token has expired. Please request a new one. |
 
 ## 13.7 Rate Limiting Errors
 
@@ -1515,6 +1638,23 @@ All errors follow RFC 7807 format with a machine-readable `type` URI, `title`, `
 | ERR-SYS-001 | 503 | `/errors/service-unavailable` | The authentication service is temporarily unavailable. |
 | ERR-SYS-002 | 503 | `/errors/dependency-unavailable` | A required upstream service is unavailable. |
 | ERR-SYS-003 | 500 | `/errors/internal-error` | An internal error occurred. Includes `trace_id` for support. |
+
+## 13.9 Code Client Catalog (Draft)
+
+`code_client` is a 2-digit numeric string, independent of `code` and of HTTP status, that tells the web/mobile client which generic post-error UI action to take without needing to know every individual `code`. Only `00` and `05` are finalized; the rest are an initial proposal for the team to refine.
+
+| code_client | Meaning | Client Action | Status | Example `code` values |
+|---|---|---|---|---|
+| 00 | Success | No action. | **Final** | (success responses) |
+| 01 | Validation / Retry | Show inline field error, let user correct and resubmit. | Draft | ERR-REQUEST-001..005, ERR-PWD-001..009, ERR-MFA-003, ERR-MFA-005, ERR-MFA-009, ERR-MFA-010, ERR-MFA-011, ERR-SESSION-003, ERR-TOKEN-005 |
+| 02 | Credentials | Show generic auth-failure message, stay on login/verification form. | Draft | ERR-LOGIN-001, ERR-LOGIN-002, ERR-MFA-001, ERR-MFA-002, ERR-MFA-007 |
+| 03 | Lockout | Show locked-account modal, optionally with countdown from `locked_until`. | Draft | ERR-LOGIN-003 |
+| 04 | Rate Limited | Show backoff/retry-after banner. | Draft | ERR-RATE-001, ERR-MFA-006, ERR-MFA-008, ERR-MFA-ENROLL-002 |
+| 05 | Session | Clear local session/tokens and redirect to the login page. | **Final** | ERR-SESSION-002, ERR-TOKEN-004, ERR-TOKEN-001, ERR-TOKEN-002, ERR-TOKEN-003 |
+| 06 | Restart Flow | Discard the current short-lived flow token and restart that sub-flow from the beginning. | Draft | ERR-LOGIN-004, ERR-LOGIN-005, ERR-MFA-004, ERR-MFA-ENROLL-001, ERR-PWD-011, ERR-PWD-012, ERR-PWD-013 |
+| 07 | System | Show generic "something went wrong, try again later" message. | Draft | ERR-SYS-001, ERR-SYS-002, ERR-SYS-003 |
+
+**Note (draft — usulan awal untuk didiskusikan tim, belum final):** buckets 01–04, 06, 07 and the `code` → `code_client` assignments above are a starting proposal only; §13.9 is expected to evolve as web/mobile teams validate the actual UI flows against each code.
 
 ---
 

@@ -447,7 +447,7 @@ Menerima **Company Code**, **Username**, dan kata sandi. Sistem me-resolve pasan
 - Resolusi pengenal wajib terjadi **sebelum** verifikasi kata sandi, karena kebijakan lockout dan kebijakan MFA dievaluasi per identitas.
 
 **Aktor tanpa korporasi (Bank Administrator):**
-Bank Administrator tidak dimiliki oleh korporasi mana pun. Untuk klien Bank Administration Portal, `company_code` **dihilangkan** dari permintaan dan resolusi dilakukan di dalam realm internal bank. Modul menentukan realm dari `client_id`, bukan dari masukan pengguna — sehingga pengguna korporasi tidak dapat menjangkau realm bank admin dengan mengosongkan `company_code`. Menghilangkan `company_code` pada klien korporasi adalah `400 Bad Request`.
+Bank Administrator tidak dimiliki oleh korporasi mana pun, dan login lewat endpoint terpisah, `POST /api/v1/auth/admin/login` (§11.1), yang memang tidak memiliki field `company_code` sama sekali — bukan lagi field yang sama dengan pilihan "dihilangkan atau tidak" pada satu endpoint bersama. Endpoint ini hanya bisa diakses oleh BFF Bank Administration Portal (diverifikasi mTLS/SPIFFE via Istio `AuthorizationPolicy`, FRD FR-LOGIN-001a), sehingga pengguna korporasi tidak dapat menjangkau realm bank admin — bukan karena mereka "mengosongkan `company_code`", tapi karena mereka secara fisik tidak bisa mencapai endpoint ini. Menghilangkan `company_code` pada `POST /api/v1/auth/login` (korporasi) tetap `ERR-REQUEST-003` (lihat §13.0).
 
 **Pencegahan enumerasi korporasi:**
 `company_code` yang tidak dikenal harus menghasilkan respons, kode status, dan profil waktu yang identik dengan kata sandi salah (lihat FR-LOGIN-003). Sistem tidak boleh mengungkapkan apakah suatu korporasi terdaftar.
@@ -796,22 +796,33 @@ Hal ini menjamin pengiriman at-least-once tanpa transaksi terdistribusi.
 
 # 11. Desain REST API
 
-Seluruh API: JSON, diversikan di bawah `/api/v1/auth`, wajib HTTPS. Galat mengikuti RFC 7807.
+Seluruh API: JSON, diversikan di bawah `/api/v1/auth`, wajib HTTPS. Galat mengikuti RFC 7807, minus field `status`. Status HTTP transport adalah 200 untuk seluruh error bisnis (kredensial tidak valid, akun tidak ditemukan, akun terkunci, body request tidak valid, dll.); hanya `ERR-SESSION-002`/`ERR-TOKEN-004` (diverifikasi lewat introspeksi token di API gateway), keluarga rate-limit 429, dan error sistem 5xx yang tetap memakai status HTTP asli. Setiap body response — sukses maupun galat — selalu membawa field `code` dan `code_client` di level atas; saat sukses keduanya bernilai `"00"`. Lihat FRD §13 untuk katalog error lengkap dan §13.9 untuk katalog `code_client` (draf).
 
 ## Respons Galat Standar
+
+Contoh untuk error bisnis (HTTP 200 — kredensial tidak valid):
 
 ```json
 {
   "type": "https://auth.bank.com/errors/invalid-credentials",
   "title": "Invalid Credentials",
-  "status": 401,
   "detail": "The provided credentials are incorrect.",
   "instance": "/api/v1/auth/login",
+  "code": "ERR-LOGIN-001",
+  "code_client": "02",
   "trace_id": "a3f9b2c1-1234-5678-abcd-ef1234567890"
 }
 ```
 
 ## 11.1 API Login
+
+Login sekarang terbagi ke **tiga endpoint terpisah**, satu per client pemanggil, masing-masing dengan mekanisme berbeda untuk membuktikan identitas client (lihat FRD FR-LOGIN-001 & FR-LOGIN-001a):
+
+| Endpoint | Pemanggil | Identitas client dibuktikan via |
+|---|---|---|
+| `POST /api/v1/auth/login` | BFF Corporate Portal (service Go, satu mesh dengan Auth Service) | mTLS peer identity (SPIFFE ID) Istio, ditegakkan `AuthorizationPolicy`. Tidak menerima field `client_id`. |
+| `POST /api/v1/auth/admin/login` | BFF Bank Administration Portal (service Go, satu mesh) | mTLS peer identity (SPIFFE ID) Istio, ditegakkan `AuthorizationPolicy`. Tidak menerima field `client_id`. Tidak menerima `company_code` — resolusi selalu di realm internal bank. |
+| `POST /api/v1/auth/mobile/login` | Aplikasi Mobile Approval (native, di luar mesh) | Field `client_id` yang diklaim sendiri — **tidak terautentikasi**. Lihat FRD BR-013 untuk batasan penggunaannya. |
 
 ### POST /api/v1/auth/login
 
@@ -827,8 +838,7 @@ Seluruh API: JSON, diversikan di bawah `/api/v1/auth`, wajib HTTPS. Galat mengik
     "timezone": "Asia/Jakarta",
     "language": "en-US",
     "platform": "Win32"
-  },
-  "client_id": "corporate-portal"
+  }
 }
 ```
 
@@ -841,7 +851,9 @@ Seluruh API: JSON, diversikan di bawah `/api/v1/auth`, wajib HTTPS. Galat mengik
   "expires_in": 900,
   "refresh_token": "dGhpcyBpcyBhIHNlY3...",
   "session_id": "sess_01H9XZ7K2...",
-  "aal": "AAL1"
+  "aal": "AAL1",
+  "code": "00",
+  "code_client": "00"
 }
 ```
 
@@ -852,16 +864,101 @@ Seluruh API: JSON, diversikan di bawah `/api/v1/auth`, wajib HTTPS. Galat mengik
   "mfa_session_token": "mfa_sess_7Xyz...",
   "mfa_session_expires_in": 600,
   "available_factors": ["TOTP", "SMS_OTP"],
-  "masked_phone": "+62-***-****-7890"
+  "masked_phone": "+62-***-****-7890",
+  "code": "00",
+  "code_client": "00"
 }
 ```
 
-**Response 400:** `company_code` tidak ada pada klien korporasi, atau format pengenal tidak valid.
-**Response 401:** Galat generik kredensial tidak valid — dikembalikan secara identik untuk company code tidak dikenal, username tidak dikenal, dan kata sandi salah.
-**Response 423:** Akun terkunci (menyertakan `locked_until`).
-**Response 429:** Terkena rate limit (menyertakan `retry_after`).
+**Response 200 (code: ERR-REQUEST-003):** `company_code` tidak ada, atau format pengenal tidak valid.
+**Response 200 (code: ERR-LOGIN-001):** Galat generik kredensial tidak valid — dikembalikan secara identik untuk company code tidak dikenal, username tidak dikenal, dan kata sandi salah.
+**Response 200 (code: ERR-LOGIN-003):** Akun terkunci (menyertakan `locked_until`).
+**Response 429 (code: ERR-RATE-001):** Terkena rate limit (menyertakan `retry_after`).
 
-**Catatan `company_code`:** Wajib untuk klien korporasi (`corporate-portal`, aplikasi mobile). Dihilangkan untuk `bank-admin-portal`, yang di-resolve di dalam realm internal bank. Realm ditentukan dari `client_id` yang terautentikasi, bukan dari ada atau tidaknya field ini.
+**Verifikasi caller (mesh):** Endpoint ini hanya menerima request dari BFF Corporate Portal — ditegakkan Istio `AuthorizationPolicy` berdasar SPIFFE ID (`spiffe://cluster.local/ns/corporate-portal/sa/bff`), bukan dari isi body. Request dari peer lain ditolak mesh sebelum mencapai Auth Service. Identitas peer yang terverifikasi inilah yang dipakai server untuk kebijakan sesi bersamaan dan klaim `aud` di JWT — lihat FRD FR-LOGIN-001a.
+
+### POST /api/v1/auth/admin/login
+
+**Request:**
+```json
+{
+  "username": "admin.jane",
+  "password": "S3cur3P@ssword!",
+  "device_fingerprint": {
+    "user_agent": "Mozilla/5.0...",
+    "screen_resolution": "1920x1080",
+    "timezone": "Asia/Jakarta",
+    "language": "en-US",
+    "platform": "Win32"
+  }
+}
+```
+
+Tidak ada field `company_code` — Bank Administrator tidak dimiliki korporasi mana pun, resolusi selalu di realm internal bank (bukan lagi dari ada/tidaknya field, tapi karena endpoint ini memang khusus itu).
+
+**Response 200 — MFA tidak diperlukan / diperlukan:** sama seperti `/auth/login` di atas.
+**Response 200 (code: ERR-LOGIN-001):** Galat generik kredensial tidak valid.
+**Response 200 (code: ERR-LOGIN-003):** Akun terkunci.
+**Response 429 (code: ERR-RATE-001):** Terkena rate limit.
+
+**Catatan MFA:** Untuk identity Bank Administrator, MFA selalu wajib (BR-003) — baik karena identity itu sendiri berstatus Bank Administrator di Identity Context, maupun karena request masuk lewat endpoint ini. Keduanya sengaja redundan (defense-in-depth, FRD BR-013), bukan salah satunya dianggap cukup sendirian.
+
+**Verifikasi caller (mesh):** Sama seperti `/auth/login` — hanya menerima request dari BFF Bank Administration Portal (`spiffe://cluster.local/ns/bank-admin/sa/bff`), ditegakkan `AuthorizationPolicy`.
+
+### POST /api/v1/auth/mobile/login
+
+**Request:**
+```json
+{
+  "company_code": "ACME01",
+  "username": "john.smith",
+  "password": "S3cur3P@ssword!",
+  "device_fingerprint": {
+    "user_agent": "Mozilla/5.0...",
+    "screen_resolution": "1920x1080",
+    "timezone": "Asia/Jakarta",
+    "language": "en-US",
+    "platform": "Win32"
+  },
+  "client_id": "mobile-approval"
+}
+```
+
+Response sama seperti `/auth/login`. `client_id` di sini **tidak terautentikasi** — cuma dipakai untuk kebutuhan non-keamanan (kebijakan TTL refresh token, label `aud`, audit) dan bukan penentu tunggal keputusan MFA-wajib/kebijakan sesi (FRD BR-013). Kandidat pengerasan lebih lanjut: PKCE atau app attestation (§16.1).
+
+### POST /api/v1/auth/mfa/otp/sms
+
+Memicu pengiriman kode OTP (untuk faktor `SMS_OTP`) via SMS. Dipanggil saat `available_factors` pada respons login berisi `SMS_OTP` dan user memilih menerima kode lewat SMS.
+
+**Request:**
+```json
+{
+  "mfa_session_token": "mfa_sess_7Xyz..."
+}
+```
+
+**Response 204:** No Content — kode terkirim.
+**Response 200 (code: ERR-MFA-004):** `mfa_session_token` tidak valid/kedaluwarsa.
+**Response 200 (code: ERR-MFA-011):** Tidak ada nomor telepon terdaftar; channel OTP tidak tersedia.
+**Response 429 (code: ERR-MFA-008):** Terlalu banyak permintaan OTP (limit dihitung gabungan dengan `/mfa/otp/wa`, lihat catatan di bawah).
+
+### POST /api/v1/auth/mfa/otp/wa
+
+Memicu pengiriman kode OTP yang sama via WhatsApp, sebagai alternatif kanal dari `/mfa/otp/sms`.
+
+**Request:**
+```json
+{
+  "mfa_session_token": "mfa_sess_7Xyz..."
+}
+```
+
+**Response 204:** No Content — kode terkirim.
+**Response 200 (code: ERR-MFA-004):** `mfa_session_token` tidak valid/kedaluwarsa.
+**Response 200 (code: ERR-MFA-011):** Tidak ada nomor telepon terdaftar; channel OTP tidak tersedia.
+**Response 429 (code: ERR-MFA-008):** Terlalu banyak permintaan OTP (limit dihitung gabungan dengan `/mfa/otp/sms`).
+
+**Catatan `/mfa/otp/sms` dan `/mfa/otp/wa`:** Kedua endpoint mengirim kode OTP yang **sama** (satu kredensial, dua kanal pengiriman) — memicu salah satunya akan menggantikan OTP pending dari kanal lainnya (hanya kode yang paling terakhir dikirim yang valid), dan rate limit "maksimal 3x per 10 menit" (`ERR-MFA-008`) dihitung gabungan lintas kedua endpoint per `identity_id`, supaya user tidak bisa mem-bypass limit dengan bergantian kanal. Saat verifikasi, `factor_type` yang dikirim ke `/mfa/verify` tetap `SMS_OTP` untuk kedua kanal — kanal pengiriman transparan terhadap proses verifikasi (lihat FRD FR-MFA-ENROLL-007).
 
 ### POST /api/v1/auth/mfa/verify
 
@@ -874,7 +971,11 @@ Seluruh API: JSON, diversikan di bawah `/api/v1/auth`, wajib HTTPS. Galat mengik
 }
 ```
 
-**Response 200:** Respons access token penuh dengan `aal: "AAL2"`.
+**Response 200:** Respons access token penuh dengan `aal: "AAL2"` plus `"code": "00", "code_client": "00"`.
+**Response 200 (code: ERR-MFA-001):** Kode MFA tidak valid.
+**Response 200 (code: ERR-MFA-002):** Kode MFA sudah pernah dipakai.
+**Response 200 (code: ERR-LOGIN-004):** MFA session token tidak valid.
+**Response 200 (code: ERR-MFA-004):** MFA session sudah kedaluwarsa.
 
 ### POST /api/v1/auth/logout
 
@@ -886,14 +987,16 @@ Seluruh API: JSON, diversikan di bawah `/api/v1/auth`, wajib HTTPS. Galat mengik
 
 ### POST /api/v1/auth/token/refresh
 
-**Request:** `{ "refresh_token": "...", "client_id": "corporate-portal" }`
-**Response 200:** Access token baru + refresh token baru.
-**Response 401 (penggunaan ulang terdeteksi):** Seluruh sesi dicabut; pesan galat menunjukkan adanya anomali keamanan.
+**Request (dari BFF Corporate Portal / Bank Administration Portal):** `{ "refresh_token": "..." }` — identitas client diambil dari mTLS peer identity yang sama seperti saat login, bukan field body (FRD FR-TOKEN-005).
+**Request (dari Mobile Approval):** `{ "refresh_token": "...", "client_id": "mobile-approval" }`
+**Response 200:** Access token baru + refresh token baru, plus `"code": "00", "code_client": "00"`.
+**Response 200 (code: ERR-TOKEN-003, penggunaan ulang terdeteksi):** Seluruh sesi dicabut; pesan galat menunjukkan adanya anomali keamanan; `code_client: "05"` (klien wajib membersihkan sesi dan redirect ke login).
+**Response 200 (code: ERR-TOKEN-001/ERR-TOKEN-002):** Refresh token tidak valid, kedaluwarsa, atau sudah dicabut; `code_client: "05"`.
 
 ### POST /api/v1/auth/token/revoke (RFC 7009)
 
 **Request:** `{ "token": "...", "token_type_hint": "refresh_token" }`
-**Response:** Selalu 200 (mencegah enumerasi).
+**Response:** Selalu 200 (mencegah enumerasi), dengan `"code": "00", "code_client": "00"`.
 
 ### POST /api/v1/auth/token/introspect (RFC 7662)
 
@@ -959,15 +1062,19 @@ Mencabut perangkat dan seluruh sesi terkait. Mengembalikan 204.
 
 ### POST /api/v1/auth/password/change
 **Request:** `{ "current_password": "...", "new_password": "..." }`
-**Response:** 204 No Content.
+**Response 204:** No Content (sukses).
+**Response 200 (code: ERR-PWD-010):** Kata sandi saat ini salah.
+**Response 200 (code: ERR-PWD-001..009):** Kata sandi baru melanggar kebijakan.
 
 ### POST /api/v1/auth/password/forgot
 **Request:** `{ "company_code": "ACME01", "username": "john.smith" }`
-**Response:** Selalu 200 dengan pesan generik — termasuk ketika `company_code` tidak dikenal.
+**Response:** Selalu 200 dengan pesan generik — termasuk ketika `company_code` tidak dikenal — dengan `"code": "00", "code_client": "00"` (mencegah enumerasi akun).
 
 ### POST /api/v1/auth/password/reset
 **Request:** `{ "reset_token": "...", "new_password": "..." }`
-**Response:** 204 No Content.
+**Response 204:** No Content (sukses).
+**Response 200 (code: ERR-PWD-011/012/013):** Reset token tidak valid, sudah dipakai, atau kedaluwarsa.
+**Response 200 (code: ERR-PWD-001..009):** Kata sandi baru melanggar kebijakan.
 
 ## 11.6 API Sesi
 
@@ -1672,7 +1779,7 @@ sequenceDiagram
 
     U->>AP: POST /auth/login {company_code, username, password, device_fp}
     AP->>AS: Teruskan permintaan (rate limit diperiksa di gateway)
-    AS->>AS: Normalisasi company_code; tentukan realm dari client_id
+    AS->>AS: Normalisasi company_code (realm sudah ditentukan oleh endpoint yang dipanggil + identitas peer mTLS, bukan lagi client_id — lihat FRD FR-LOGIN-001a)
     AS->>RD: Periksa rate limit untuk IP + company_code + username
     RD-->>AS: OK
     AS->>ID: resolveIdentity(company_code, username) melalui ACL
@@ -1680,8 +1787,8 @@ sequenceDiagram
         ID-->>AS: NOT_FOUND
         AS->>AS: Jalankan verifikasi hash tiruan (waktu respons konstan)
         AS->>KB: Publikasikan LoginFailed (outbox, identity_id null)
-        AS-->>AP: 401 Unauthorized (galat generik)
-        AP-->>U: 401
+        AS-->>AP: 200 (ERR-LOGIN-002)
+        AP-->>U: 200 (ERR-LOGIN-002)
     else Ter-resolve
         ID-->>AS: identity_id
     end
@@ -1691,8 +1798,8 @@ sequenceDiagram
     alt Kata sandi tidak valid
         AS->>CR: Naikkan failed_attempt_count
         AS->>KB: Publikasikan LoginFailed (outbox)
-        AS-->>AP: 401 Unauthorized
-        AP-->>U: 401
+        AS-->>AP: 200 (ERR-LOGIN-001)
+        AP-->>U: 200 (ERR-LOGIN-001)
     else Kata sandi valid
         AS->>AS: Evaluasi sidik jari perangkat
         AS->>SD: Buat AuthenticationSession
@@ -1736,8 +1843,8 @@ sequenceDiagram
     AS->>AS: Dekripsi; hitung kode TOTP yang diharapkan (jendela ±1)
     alt Kode tidak valid
         AS->>RD: Naikkan penghitung kegagalan MFA
-        AS-->>AP: 401 Invalid MFA Code
-        AP-->>U: 401
+        AS-->>AP: 200 (ERR-MFA-001)
+        AP-->>U: 200 (ERR-MFA-001)
     else Kode valid
         AS->>RD: Hapus state sesi MFA
         AS->>AS: Buat Sesi (AAL2), tanda tangani Access Token
@@ -1793,11 +1900,11 @@ sequenceDiagram
         AS->>SD: Cabut sesi terkait
         AS->>RD: Bersihkan data sesi yang di-cache
         AS->>KB: Publikasikan RefreshTokenFamilyCompromised (outbox)
-        AS-->>AP: 401 Token Reuse Detected
-        AP-->>C: 401
+        AS-->>AP: 200 (ERR-TOKEN-003)
+        AP-->>C: 200 (ERR-TOKEN-003)
     else Token REVOKED atau EXPIRED
-        AS-->>AP: 401 Invalid Token
-        AP-->>C: 401
+        AS-->>AP: 200 (ERR-TOKEN-002)
+        AP-->>C: 200 (ERR-TOKEN-002)
     else Token ACTIVE
         AS->>SD: Validasi sesi berstatus ACTIVE
         AS->>SD: Tandai token saat ini sebagai USED
@@ -1855,13 +1962,13 @@ sequenceDiagram
     AS->>AS: Hash token yang dikirim (SHA-256)
     AS->>CR: Cari token reset berdasarkan hash
     alt Token tidak valid/kedaluwarsa/terpakai
-        AS-->>AP: 400 Invalid or Expired Token
-        AP-->>U: 400
+        AS-->>AP: 200 (ERR-PWD-011)
+        AP-->>U: 200 (ERR-PWD-011)
     else Token valid
         AS->>AS: Validasi new_password (kebijakan + riwayat)
         alt Pelanggaran kebijakan
-            AS-->>AP: 422 Password Policy Violation
-            AP-->>U: 422
+            AS-->>AP: 200 (ERR-PWD-001..009)
+            AP-->>U: 200 (ERR-PWD-001..009)
         else Kebijakan terpenuhi
             AS->>CR: Perbarui hash kata sandi; tandai token terpakai; tambahkan yang lama ke riwayat
             AS->>SD: Cabut seluruh sesi untuk identitas
@@ -1889,13 +1996,13 @@ sequenceDiagram
     AS->>CR: Muat credential; verifikasi current_password
     alt Kata sandi saat ini tidak valid
         AS->>CR: Naikkan failed_attempt_count
-        AS-->>AP: 401 Current Password Incorrect
-        AP-->>U: 401
+        AS-->>AP: 200 (ERR-PWD-010)
+        AP-->>U: 200 (ERR-PWD-010)
     else Valid
         AS->>AS: Validasi new_password (kebijakan + riwayat)
         alt Pelanggaran kebijakan
-            AS-->>AP: 422
-            AP-->>U: 422
+            AS-->>AP: 200 (ERR-PWD-001..009)
+            AP-->>U: 200 (ERR-PWD-001..009)
         else Sesuai
             AS->>CR: Perbarui hash; tambahkan yang lama ke riwayat
             AS->>SD: Cabut seluruh sesi KECUALI sesi saat ini
@@ -1966,12 +2073,13 @@ sequenceDiagram
 
 | Grant Type | Digunakan Oleh | Catatan |
 |---|---|---|
-| Resource Owner Password Credentials (ROPC) | Portal internal (Fase 1, transisional) | Ditinggalkan pada Fase 2; klien menerima kata sandi mentah |
-| Authorization Code + PKCE | Corporate Portal, Mobile (Fase 2) | Paling aman untuk alur yang berhadapan dengan pengguna |
+| Resource Owner Password Credentials (ROPC), client diautentikasi via mTLS mesh | BFF Corporate Portal (`/auth/login`), BFF Bank Administration Portal (`/auth/admin/login`) | Client menerima kata sandi mentah dari user-nya sendiri, tapi identitas BFF pemanggil diverifikasi Istio `AuthorizationPolicy` (FR-LOGIN-001a), bukan dari field `client_id` yang diklaim sendiri — lihat BR-013. Fase 1. |
+| Resource Owner Password Credentials (ROPC), client tidak terautentikasi | Mobile Approval (`/auth/mobile/login`) | Client menerima kata sandi mentah; app pemanggil cuma diidentifikasi dari `client_id` yang diklaim sendiri (belum ada autentikasi client). Fase 1, transisional — kandidat PKCE atau app attestation. |
+| Authorization Code + PKCE | Mobile (kandidat, Fase 2) | Menutup celah `client_id` tak-terautentikasi pada satu-satunya public client yang tersisa; tidak lagi diperlukan untuk Corporate Portal / Bank Administration Portal karena BFF keduanya sudah terautentikasi lewat mesh. |
 | Client Credentials | Akses API mesin-ke-mesin | Klien tingkat sistem; tanpa konteks pengguna |
 | Refresh Token | Semua klien | Perpanjangan masa berlaku token |
 
-**Trade-off:** ROPC disertakan hanya untuk Fase 1. Harus ditinggalkan pada Fase 2. Hanya dapat diterima untuk aplikasi first-party yang sepenuhnya tepercaya dengan batasan scope yang ketat.
+**Trade-off:** baris ROPC yang dimediasi BFF sudah bisa diterima secara jangka panjang — autentikasi client di situ nyata (mTLS), bukan sekadar diasumsikan. Baris ROPC client-tak-terautentikasi (Mobile Approval) tetap trade-off transisional, dapat diterima hanya karena keputusan MFA-wajib dan kebijakan sesi tidak lagi bergantung pada `client_id` yang diklaim sendiri (BR-013); tetap perlu diperkuat (PKCE atau app attestation), bukan dibiarkan begitu saja.
 
 ## 16.2 OpenID Connect (OIDC)
 
@@ -2260,8 +2368,8 @@ Waktu hash 300 ms bersifat disengaja: membuat brute force mahal secara komputasi
 
 ## Fase 2
 
-**F-001: Alur Authorization Code + PKCE**
-Memigrasikan Corporate Portal dan Bank Administration Portal dari ROPC ke Authorization Code + PKCE, menghilangkan penanganan kata sandi mentah oleh aplikasi.
+**F-001: Alur Authorization Code + PKCE (atau app attestation) untuk Mobile Approval**
+Corporate Portal dan Bank Administration Portal tidak lagi butuh migrasi ini sejak §11.1/§16.1 — BFF keduanya sudah autentikasi ke Auth Service lewat mTLS mesh (Istio `AuthorizationPolicy`), yang sudah menutup celah `client_id` tak-terautentikasi yang dimiliki ROPC. `POST /api/v1/auth/mobile/login` (Mobile Approval) tetap satu-satunya client yang identitas app-nya belum dibuktikan secara kriptografis; perkuat lewat Authorization Code + PKCE atau app attestation platform (Play Integrity / App Attest), agar tidak lagi bergantung pada `client_id` yang diklaim sendiri di jalur itu juga.
 
 **F-002: Passkey / Login Tanpa Kata Sandi**
 Dukungan passkey penuh (kredensial FIDO2 yang dapat ditemukan dan disinkronkan melalui keychain platform). Pengguna login dengan biometrik tanpa kata sandi.

@@ -765,22 +765,33 @@ This guarantees at-least-once delivery without distributed transactions.
 
 # 11. REST API Design
 
-All APIs: JSON, versioned under `/api/v1/auth`, HTTPS required. Errors conform to RFC 7807.
+All APIs: JSON, versioned under `/api/v1/auth`, HTTPS required. Errors conform to RFC 7807, minus the `status` field. HTTP transport status is 200 for all business-logic errors (invalid credentials, account not found, locked account, bad request body, etc.); only `ERR-SESSION-002`/`ERR-TOKEN-004` (verified via API gateway token introspection), the 429 rate-limit family, and 5xx system errors keep their real HTTP status. Every response body — success or error — carries top-level `code` and `code_client` fields; on success both are `"00"`. See FRD §13 for the full error catalog and §13.9 for the `code_client` catalog (draft).
 
 ## Standard Error Response
+
+Example for a business error (HTTP 200 — invalid credentials):
 
 ```json
 {
   "type": "https://auth.bank.com/errors/invalid-credentials",
   "title": "Invalid Credentials",
-  "status": 401,
   "detail": "The provided credentials are incorrect.",
   "instance": "/api/v1/auth/login",
+  "code": "ERR-LOGIN-001",
+  "code_client": "02",
   "trace_id": "a3f9b2c1-1234-5678-abcd-ef1234567890"
 }
 ```
 
 ## 11.1 Login APIs
+
+Login is split into **three distinct endpoints**, one per calling client, each with a different mechanism for establishing client identity (see FRD FR-LOGIN-001 & FR-LOGIN-001a):
+
+| Endpoint | Caller | Client identity established via |
+|---|---|---|
+| `POST /api/v1/auth/login` | Corporate Portal BFF (Go service, in-mesh) | Istio mTLS peer identity (SPIFFE ID), enforced by `AuthorizationPolicy`. Does not accept a `client_id` field. |
+| `POST /api/v1/auth/admin/login` | Bank Administration Portal BFF (Go service, in-mesh) | Istio mTLS peer identity (SPIFFE ID), enforced by `AuthorizationPolicy`. Does not accept a `client_id` field. |
+| `POST /api/v1/auth/mobile/login` | Mobile Approval app (native, outside the mesh) | Self-declared `client_id` field — unauthenticated. See FRD BR-013 for the resulting constraint on its use. |
 
 ### POST /api/v1/auth/login
 
@@ -795,8 +806,7 @@ All APIs: JSON, versioned under `/api/v1/auth`, HTTPS required. Errors conform t
     "timezone": "Asia/Jakarta",
     "language": "en-US",
     "platform": "Win32"
-  },
-  "client_id": "corporate-portal"
+  }
 }
 ```
 
@@ -809,7 +819,9 @@ All APIs: JSON, versioned under `/api/v1/auth`, HTTPS required. Errors conform t
   "expires_in": 900,
   "refresh_token": "dGhpcyBpcyBhIHNlY3...",
   "session_id": "sess_01H9XZ7K2...",
-  "aal": "AAL1"
+  "aal": "AAL1",
+  "code": "00",
+  "code_client": "00"
 }
 ```
 
@@ -820,13 +832,97 @@ All APIs: JSON, versioned under `/api/v1/auth`, HTTPS required. Errors conform t
   "mfa_session_token": "mfa_sess_7Xyz...",
   "mfa_session_expires_in": 600,
   "available_factors": ["TOTP", "SMS_OTP"],
-  "masked_phone": "+62-***-****-7890"
+  "masked_phone": "+62-***-****-7890",
+  "code": "00",
+  "code_client": "00"
 }
 ```
 
-**Response 401:** Generic invalid credentials error.
-**Response 423:** Account locked (includes `locked_until`).
-**Response 429:** Rate limited (includes `retry_after`).
+**Response 200 (code: ERR-LOGIN-001):** Generic invalid credentials error.
+**Response 200 (code: ERR-LOGIN-003):** Account locked (includes `locked_until`).
+**Response 429 (code: ERR-RATE-001):** Rate limited (includes `retry_after`).
+
+**Caller verification (mesh):** This endpoint only accepts requests from the Corporate Portal BFF — enforced by an Istio `AuthorizationPolicy` keyed on SPIFFE ID (`spiffe://cluster.local/ns/corporate-portal/sa/bff`), not on anything in the body. Requests from any other peer are rejected by the mesh before reaching the Authentication Service. This verified peer identity is what the server uses for concurrent session policy and the JWT `aud` claim — see FRD FR-LOGIN-001a.
+
+### POST /api/v1/auth/admin/login
+
+**Request:**
+```json
+{
+  "identifier": "admin.jane",
+  "password": "S3cur3P@ssword!",
+  "device_fingerprint": {
+    "user_agent": "Mozilla/5.0...",
+    "screen_resolution": "1920x1080",
+    "timezone": "Asia/Jakarta",
+    "language": "en-US",
+    "platform": "Win32"
+  }
+}
+```
+
+**Response 200 — MFA not required / required:** same shape as `/auth/login` above.
+**Response 200 (code: ERR-LOGIN-001):** Generic invalid credentials error.
+**Response 200 (code: ERR-LOGIN-003):** Account locked.
+**Response 429 (code: ERR-RATE-001):** Rate limited.
+
+**Note on MFA:** For a Bank Administrator identity, MFA is always mandatory (BR-003) — both because the identity itself is flagged as a Bank Administrator in the Identity Context, and because the request arrived via this endpoint. Both conditions are deliberately redundant (defense-in-depth, FRD BR-013), not relied on individually.
+
+**Caller verification (mesh):** Same mechanism as `/auth/login` — this endpoint only accepts requests from the Bank Administration Portal BFF (`spiffe://cluster.local/ns/bank-admin/sa/bff`), enforced by `AuthorizationPolicy`.
+
+### POST /api/v1/auth/mobile/login
+
+**Request:**
+```json
+{
+  "identifier": "john.smith",
+  "password": "S3cur3P@ssword!",
+  "device_fingerprint": {
+    "user_agent": "Mozilla/5.0...",
+    "screen_resolution": "1920x1080",
+    "timezone": "Asia/Jakarta",
+    "language": "en-US",
+    "platform": "Win32"
+  },
+  "client_id": "mobile-approval"
+}
+```
+
+Response shape is the same as `/auth/login`. `client_id` here is **unauthenticated** — it is used only for non-security bookkeeping (refresh token TTL policy, `aud` labeling, audit) and is never the sole basis for a mandatory-MFA or session-policy decision (FRD BR-013). Candidate hardening: PKCE or app attestation (§16.1).
+
+### POST /api/v1/auth/mfa/otp/sms
+
+Triggers delivery of the OTP code (for the `SMS_OTP` factor) via SMS. Called when the login response's `available_factors` includes `SMS_OTP` and the user chooses to receive the code by SMS.
+
+**Request:**
+```json
+{
+  "mfa_session_token": "mfa_sess_7Xyz..."
+}
+```
+
+**Response 204:** No Content — code sent.
+**Response 200 (code: ERR-MFA-004):** `mfa_session_token` invalid/expired.
+**Response 200 (code: ERR-MFA-011):** No phone number registered; OTP channel unavailable.
+**Response 429 (code: ERR-MFA-008):** Too many OTP requests (counter shared with `/mfa/otp/wa`, see note below).
+
+### POST /api/v1/auth/mfa/otp/wa
+
+Triggers delivery of the same OTP code via WhatsApp, as an alternative channel to `/mfa/otp/sms`.
+
+**Request:**
+```json
+{
+  "mfa_session_token": "mfa_sess_7Xyz..."
+}
+```
+
+**Response 204:** No Content — code sent.
+**Response 200 (code: ERR-MFA-004):** `mfa_session_token` invalid/expired.
+**Response 200 (code: ERR-MFA-011):** No phone number registered; OTP channel unavailable.
+**Response 429 (code: ERR-MFA-008):** Too many OTP requests (counter shared with `/mfa/otp/sms`).
+
+**Note on `/mfa/otp/sms` and `/mfa/otp/wa`:** Both endpoints deliver the **same** OTP code (one credential, two delivery channels) — triggering either one invalidates any still-pending OTP from the other channel (only the most recently sent code is valid), and the "max 3 per 10 minutes" rate limit (`ERR-MFA-008`) is counted jointly across both endpoints per `identity_id`, so a user cannot bypass the limit by alternating channels. When verifying, `factor_type` submitted to `/mfa/verify` remains `SMS_OTP` for either channel — the delivery channel is transparent to verification (see FRD FR-MFA-ENROLL-007).
 
 ### POST /api/v1/auth/mfa/verify
 
@@ -839,7 +935,11 @@ All APIs: JSON, versioned under `/api/v1/auth`, HTTPS required. Errors conform t
 }
 ```
 
-**Response 200:** Full access token response with `aal: "AAL2"`.
+**Response 200:** Full access token response with `aal: "AAL2"` plus `"code": "00", "code_client": "00"`.
+**Response 200 (code: ERR-MFA-001):** Invalid MFA code.
+**Response 200 (code: ERR-MFA-002):** MFA code already used.
+**Response 200 (code: ERR-LOGIN-004):** MFA session token invalid.
+**Response 200 (code: ERR-MFA-004):** MFA session expired.
 
 ### POST /api/v1/auth/logout
 
@@ -851,14 +951,16 @@ All APIs: JSON, versioned under `/api/v1/auth`, HTTPS required. Errors conform t
 
 ### POST /api/v1/auth/token/refresh
 
-**Request:** `{ "refresh_token": "...", "client_id": "corporate-portal" }`
-**Response 200:** New access token + new refresh token.
-**Response 401 (reuse detected):** All sessions revoked; error message indicates security anomaly.
+**Request (from the Corporate Portal / Bank Administration Portal BFF):** `{ "refresh_token": "..." }` — client identity is taken from the same mTLS peer identity used at login, not a body field (FRD FR-TOKEN-005).
+**Request (from Mobile Approval):** `{ "refresh_token": "...", "client_id": "mobile-approval" }`
+**Response 200:** New access token + new refresh token, plus `"code": "00", "code_client": "00"`.
+**Response 200 (code: ERR-TOKEN-003, reuse detected):** All sessions revoked; error message indicates security anomaly; `code_client: "05"` (client must clear session and redirect to login).
+**Response 200 (code: ERR-TOKEN-001/ERR-TOKEN-002):** Refresh token invalid, expired, or revoked; `code_client: "05"`.
 
 ### POST /api/v1/auth/token/revoke (RFC 7009)
 
 **Request:** `{ "token": "...", "token_type_hint": "refresh_token" }`
-**Response:** Always 200 (prevents enumeration).
+**Response:** Always 200 (prevents enumeration), with `"code": "00", "code_client": "00"`.
 
 ### POST /api/v1/auth/token/introspect (RFC 7662)
 
@@ -924,15 +1026,19 @@ Revokes device and all associated sessions. Returns 204.
 
 ### POST /api/v1/auth/password/change
 **Request:** `{ "current_password": "...", "new_password": "..." }`
-**Response:** 204 No Content.
+**Response 204:** No Content (success).
+**Response 200 (code: ERR-PWD-010):** Current password incorrect.
+**Response 200 (code: ERR-PWD-001..009):** New password violates policy.
 
 ### POST /api/v1/auth/password/forgot
 **Request:** `{ "identifier": "john.smith" }`
-**Response:** Always 200 with generic message.
+**Response:** Always 200 with generic message, `"code": "00", "code_client": "00"` (prevents account enumeration).
 
 ### POST /api/v1/auth/password/reset
 **Request:** `{ "reset_token": "...", "new_password": "..." }`
-**Response:** 204 No Content.
+**Response 204:** No Content (success).
+**Response 200 (code: ERR-PWD-011/012/013):** Reset token invalid, already used, or expired.
+**Response 200 (code: ERR-PWD-001..009):** New password violates policy.
 
 ## 11.6 Session APIs
 
@@ -1598,8 +1704,8 @@ sequenceDiagram
     alt Password invalid
         AS->>CR: Increment failed_attempt_count
         AS->>KB: Publish LoginFailed (outbox)
-        AS-->>AP: 401 Unauthorized
-        AP-->>U: 401
+        AS-->>AP: 200 (ERR-LOGIN-001)
+        AP-->>U: 200 (ERR-LOGIN-001)
     else Password valid
         AS->>AS: Evaluate device fingerprint
         AS->>SD: Create AuthenticationSession
@@ -1642,8 +1748,8 @@ sequenceDiagram
     AS->>AS: Decrypt; compute expected TOTP codes (±1 window)
     alt Code invalid
         AS->>RD: Increment MFA failure count
-        AS-->>AP: 401 Invalid MFA Code
-        AP-->>U: 401
+        AS-->>AP: 200 (ERR-MFA-001)
+        AP-->>U: 200 (ERR-MFA-001)
     else Code valid
         AS->>RD: Delete MFA session state
         AS->>AS: Create Session (AAL2), sign Access Token
@@ -1699,11 +1805,11 @@ sequenceDiagram
         AS->>SD: Revoke associated session
         AS->>RD: Flush cached session data
         AS->>KB: Publish RefreshTokenFamilyCompromised (outbox)
-        AS-->>AP: 401 Token Reuse Detected
-        AP-->>C: 401
+        AS-->>AP: 200 (ERR-TOKEN-003)
+        AP-->>C: 200 (ERR-TOKEN-003)
     else Token REVOKED or EXPIRED
-        AS-->>AP: 401 Invalid Token
-        AP-->>C: 401
+        AS-->>AP: 200 (ERR-TOKEN-002)
+        AP-->>C: 200 (ERR-TOKEN-002)
     else Token ACTIVE
         AS->>SD: Validate session is ACTIVE
         AS->>SD: Mark current token as USED
@@ -1761,13 +1867,13 @@ sequenceDiagram
     AS->>AS: Hash submitted token (SHA-256)
     AS->>CR: Find reset token by hash
     alt Token invalid/expired/used
-        AS-->>AP: 400 Invalid or Expired Token
-        AP-->>U: 400
+        AS-->>AP: 200 (ERR-PWD-011)
+        AP-->>U: 200 (ERR-PWD-011)
     else Token valid
         AS->>AS: Validate new_password (policy + history)
         alt Policy violation
-            AS-->>AP: 422 Password Policy Violation
-            AP-->>U: 422
+            AS-->>AP: 200 (ERR-PWD-001..009)
+            AP-->>U: 200 (ERR-PWD-001..009)
         else Policy OK
             AS->>CR: Update password hash; mark token used; add old to history
             AS->>SD: Revoke all sessions for identity
@@ -1795,13 +1901,13 @@ sequenceDiagram
     AS->>CR: Load credential; verify current_password
     alt Current password invalid
         AS->>CR: Increment failed_attempt_count
-        AS-->>AP: 401 Current Password Incorrect
-        AP-->>U: 401
+        AS-->>AP: 200 (ERR-PWD-010)
+        AP-->>U: 200 (ERR-PWD-010)
     else Valid
         AS->>AS: Validate new_password (policy + history)
         alt Policy violation
-            AS-->>AP: 422
-            AP-->>U: 422
+            AS-->>AP: 200 (ERR-PWD-001..009)
+            AP-->>U: 200 (ERR-PWD-001..009)
         else OK
             AS->>CR: Update hash; add old to history
             AS->>SD: Revoke all sessions EXCEPT current
@@ -1872,12 +1978,13 @@ sequenceDiagram
 
 | Grant Type | Used By | Note |
 |---|---|---|
-| Resource Owner Password Credentials (ROPC) | Internal portals (Phase 1, transitional) | Deprecated in Phase 2; client receives raw password |
-| Authorization Code + PKCE | Corporate Portal, Mobile (Phase 2) | Most secure for user-facing flows |
+| Resource Owner Password Credentials (ROPC), client authenticated via mesh mTLS | Corporate Portal BFF (`/auth/login`), Bank Administration Portal BFF (`/auth/admin/login`) | Client receives raw password from its own end user, but the calling BFF's identity is verified by Istio `AuthorizationPolicy` (FR-LOGIN-001a) rather than a self-declared `client_id` — see BR-013. Phase 1. |
+| Resource Owner Password Credentials (ROPC), unauthenticated client | Mobile Approval (`/auth/mobile/login`) | Client receives raw password; calling app identified only by a self-declared `client_id` (no client authentication yet). Phase 1, transitional — candidate for PKCE or app attestation. |
+| Authorization Code + PKCE | Mobile (candidate, Phase 2) | Removes the unauthenticated `client_id` gap on the one remaining public client; no longer needed for Corporate Portal / Bank Administration Portal now that their BFFs are mesh-authenticated. |
 | Client Credentials | Machine-to-machine API access | System-level clients; no user context |
 | Refresh Token | All clients | Token lifetime extension |
 
-**Trade-off:** ROPC included for Phase 1 only. Must be deprecated in Phase 2. Acceptable only for fully trusted first-party applications with tight scope limits.
+**Trade-off:** the BFF-mediated ROPC rows are acceptable long-term — client authentication there is real (mTLS), not merely assumed. The unauthenticated-client ROPC row (Mobile Approval) remains a transitional trade-off, acceptable only because MFA-mandatory and session-policy decisions no longer depend on its self-declared `client_id` (BR-013); it should still be hardened (PKCE or app attestation) rather than left as-is indefinitely.
 
 ## 16.2 OpenID Connect (OIDC)
 
@@ -1948,7 +2055,7 @@ For browser-based clients:
 | API Gateway | 100 requests | 1 minute | IP address |
 | Login endpoint | 10 attempts | 5 minutes | IP address |
 | Login endpoint | 5 attempts | 15 minutes | Identity + IP |
-| OTP resend | 3 sends | 10 minutes | Identity |
+| OTP resend (`/mfa/otp/sms` + `/mfa/otp/wa` combined) | 3 sends | 10 minutes | Identity |
 | Password reset | 3 requests | 60 minutes | Identifier (hashed) |
 | Token introspection | 1000 requests | 1 minute | Resource server client_id |
 
@@ -2163,8 +2270,8 @@ The 300ms hash time is intentional: makes brute-force computationally expensive 
 
 ## Phase 2
 
-**F-001: Authorization Code + PKCE Flow**
-Migrate Corporate Portal and Bank Administration Portal from ROPC to Authorization Code + PKCE, eliminating raw password handling by applications.
+**F-001: Authorization Code + PKCE Flow (or app attestation) for Mobile Approval**
+Corporate Portal and Bank Administration Portal no longer need this migration as of §11.1/§16.1 — their BFFs authenticate to the Authentication Service via mesh mTLS (Istio `AuthorizationPolicy`), which already removes the unauthenticated-`client_id` gap ROPC had. `POST /api/v1/auth/mobile/login` (Mobile Approval) remains the one client where the calling app is not cryptographically verified; harden it via Authorization Code + PKCE or platform app attestation (Play Integrity / App Attest), eliminating reliance on a self-declared `client_id` there too.
 
 **F-002: Passkey / Passwordless Login**
 Full passkey support (FIDO2 discoverable credentials synchronized via platform keychain). Users log in with biometrics and no password.
