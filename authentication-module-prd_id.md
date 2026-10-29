@@ -741,7 +741,9 @@ Hexagonal Architecture (Ports and Adapters) + Clean Architecture. Microservice y
 │  │  (Inbound)   │    │   (Use Cases / Application Services)   │   │
 │  │              │    └────────────────┬───────────────────────┘   │
 │  │ - REST API   │                     │                            │
-│  │ - gRPC       │    ┌────────────────▼───────────────────────┐   │
+│  │   (utama)    │                     │                            │
+│  │ - gRPC (non- │    ┌────────────────▼───────────────────────┐   │
+│  │   unary)     │    │                                        │   │
 │  │ - Event      │    │               Domain                   │   │
 │  │   Consumer   │    │                Layer                   │   │
 │  └──────────────┘    │   (Aggregates, Domain Services,        │   │
@@ -767,6 +769,9 @@ Hexagonal Architecture (Ports and Adapters) + Clean Architecture. Microservice y
 |---|---|---|
 | Runtime | Go 1.22+ | Performa tinggi, penggunaan memori rendah, deployment sebagai binary statis tunggal |
 | Framework | stdlib / chi | Overhead minimal, kontrol eksplisit atas middleware dan routing |
+| Protokol API (utama) | REST/JSON over HTTPS | Seluruh interaksi unary (request–response); paling mudah dikonsumsi BFF, aplikasi mobile, dan API gateway |
+| Protokol API (non-unary) | gRPC (`grpc-go`) + Protocol Buffers v3 | Hanya untuk kebutuhan streaming (server, client, bidirectional); lihat §10.5 |
+| Tooling Kontrak gRPC | Buf (`buf lint`, `buf breaking`) | Linting dan deteksi breaking change pada kontrak `.proto` |
 | Basis Data | PostgreSQL 16 | Kepatuhan ACID, ekstensi enkripsi yang kuat |
 | Cache / Sesi | Redis 7 (Cluster) | Validasi token dan daftar pencabutan berlatensi rendah |
 | Message Broker | Apache Kafka | Pengiriman domain event yang durabel dan terurut |
@@ -792,11 +797,67 @@ Seluruh pod bersifat stateless. State dieksternalisasi:
 
 Hal ini menjamin pengiriman at-least-once tanpa transaksi terdistribusi.
 
+## 10.5 Strategi Transport API: REST untuk Unary, gRPC untuk Streaming
+
+Modul Autentikasi **tidak lagi menganut pendekatan gRPC-first**. Pemilihan transport ditentukan oleh pola komunikasi yang dibutuhkan, bukan oleh preferensi teknologi.
+
+### 10.5.1 Aturan Pemilihan Transport
+
+| Pola Komunikasi | Transport | Keterangan |
+|---|---|---|
+| Unary (satu request → satu response) | **REST/JSON** | Default untuk seluruh kapabilitas. Seluruh endpoint di §11 termasuk kategori ini. Tidak dibuat padanan gRPC untuk operasi unary. |
+| Server streaming (satu request → banyak response) | gRPC | Server mendorong rangkaian pesan ke client melalui satu stream. |
+| Client streaming (banyak request → satu response) | gRPC | Client mengirim rangkaian pesan, server membalas satu ringkasan. |
+| Bidirectional streaming (banyak ↔ banyak) | gRPC | Kedua pihak mengirim pesan secara independen di atas satu stream. |
+
+**Aturan keputusan:** jika suatu kebutuhan baru dapat dipenuhi dengan satu request dan satu response, kebutuhan tersebut **wajib** diekspos sebagai REST. gRPC hanya dipakai bila kebutuhan secara inheren memerlukan salah satu dari tiga pola streaming di atas. Polling REST berinterval pendek yang membebani sistem merupakan sinyal bahwa kebutuhan tersebut sebaiknya dipindah ke server streaming.
+
+### 10.5.2 Delivery Package gRPC
+
+Meskipun REST menjadi transport utama, modul ini **tetap menyediakan package gRPC** sebagai bagian dari delivery, sehingga kebutuhan streaming dapat ditambahkan tanpa merombak arsitektur:
+
+```
+auth-service/
+├── api/
+│   ├── openapi/               # Kontrak REST (OpenAPI 3.1) — sumber kebenaran untuk unary
+│   └── proto/auth/v1/         # Kontrak gRPC (.proto) — hanya RPC streaming
+├── gen/go/auth/v1/            # Stub hasil generate (protoc-gen-go, protoc-gen-go-grpc)
+└── internal/
+    ├── adapter/inbound/rest/  # Primary adapter REST (chi)
+    ├── adapter/inbound/grpc/  # Primary adapter gRPC (grpc-go): server, interceptor, mapper
+    └── application/           # Use case — dipakai bersama oleh kedua adapter
+```
+
+Ketentuan package gRPC:
+1. **Adapter tipis** — adapter gRPC hanya memetakan pesan Protobuf ke command/query application layer, sama seperti adapter REST. Tidak ada logika bisnis di adapter; keduanya memanggil use case yang sama.
+2. **Kontrak terversi** — package Protobuf memakai penamaan `auth.v1`; perubahan yang tidak kompatibel wajib dirilis di package versi baru (`auth.v2`). `buf breaking` dijalankan di CI.
+3. **Hanya RPC streaming** — `service` pada `.proto` tidak boleh berisi RPC unary. Bila RPC unary dibutuhkan untuk mendukung stream (misalnya handshake), operasi tersebut tetap diekspos via REST.
+4. **Server gRPC dapat dinonaktifkan** — listener gRPC berjalan pada port terpisah dan diaktifkan lewat konfigurasi (`GRPC_ENABLED`). Selama belum ada RPC streaming yang terdaftar, listener tidak dijalankan.
+5. **Stub client dipublikasikan** — stub Go hasil generate dipublikasikan sebagai Go module internal agar service konsumen (BFF, API gateway, Fraud Context) tidak perlu men-generate ulang.
+
+### 10.5.3 Kandidat Kebutuhan Streaming (Ilustratif)
+
+Daftar berikut **bukan komitmen scope** rilis ini; hanya contoh kebutuhan yang membenarkan pemakaian gRPC:
+
+| Pola | Kandidat RPC | Konsumen | Kegunaan |
+|---|---|---|---|
+| Server streaming | `WatchSessionRevocations` | BFF, API Gateway | Mendorong notifikasi pencabutan sesi/token (logout paksa dari Fraud Context, pencabutan oleh pengguna) secara real-time tanpa polling |
+| Server streaming | `WatchMfaChallenge` | BFF Corporate Portal | Menunggu hasil persetujuan push MFA dari aplikasi Mobile Approval tanpa long-polling |
+| Client streaming | `BulkRevokeSessions` | Bank Administration Portal (via BFF) | Mengunggah daftar sesi/pengguna dalam jumlah besar untuk dicabut, dibalas satu ringkasan hasil |
+| Bidirectional streaming | `ValidateTokens` | API Gateway | Kanal validasi/introspeksi token berlatensi rendah yang berumur panjang, mengurangi overhead per-request |
+
+### 10.5.4 Keamanan dan Penanganan Galat gRPC
+
+- **Hanya internal mesh** — endpoint gRPC tidak diekspos ke internet maupun aplikasi mobile. Identitas pemanggil dibuktikan lewat mTLS peer identity (SPIFFE ID) Istio dan ditegakkan `AuthorizationPolicy`, sama seperti endpoint login BFF di §11.1.
+- **Paritas kode galat** — galat dipetakan ke gRPC status code standar (`INVALID_ARGUMENT`, `UNAUTHENTICATED`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `INTERNAL`, dst.), dengan `code`, `code_client`, dan `trace_id` yang sama seperti REST dibawa di `google.rpc.ErrorInfo` (field `metadata`). Katalog error tetap mengacu FRD §13.
+- **Pengelolaan stream** — setiap stream wajib memiliki batas umur (max connection age), keepalive, dan batas jumlah stream konkuren per pemanggil, agar stream berumur panjang tidak menghalangi rolling deployment maupun menghabiskan resource pod.
+- **Observabilitas** — interceptor OpenTelemetry dipasang untuk seluruh RPC; metrik per stream (durasi, jumlah pesan, alasan penutupan) dicatat terpisah dari metrik REST.
+
 ---
 
 # 11. Desain REST API
 
-Seluruh API: JSON, diversikan di bawah `/api/v1/auth`, wajib HTTPS. Galat mengikuti RFC 7807, minus field `status`. Status HTTP transport adalah 200 untuk seluruh error bisnis (kredensial tidak valid, akun tidak ditemukan, akun terkunci, body request tidak valid, dll.); hanya `ERR-SESSION-002`/`ERR-TOKEN-004` (diverifikasi lewat introspeksi token di API gateway), keluarga rate-limit 429, dan error sistem 5xx yang tetap memakai status HTTP asli. Setiap body response — sukses maupun galat — selalu membawa field `code` dan `code_client` di level atas; saat sukses keduanya bernilai `"00"`. Lihat FRD §13 untuk katalog error lengkap dan §13.9 untuk katalog `code_client` (draf).
+REST adalah transport utama untuk seluruh operasi unary modul ini (lihat §10.5); kontrak gRPC hanya ada untuk kebutuhan streaming. Seluruh API: JSON, diversikan di bawah `/api/v1/auth`, wajib HTTPS. Galat mengikuti RFC 7807, minus field `status`. Status HTTP transport adalah 200 untuk seluruh error bisnis (kredensial tidak valid, akun tidak ditemukan, akun terkunci, body request tidak valid, dll.); hanya `ERR-SESSION-002`/`ERR-TOKEN-004` (diverifikasi lewat introspeksi token di API gateway), keluarga rate-limit 429, dan error sistem 5xx yang tetap memakai status HTTP asli. Setiap body response — sukses maupun galat — selalu membawa field `code` dan `code_client` di level atas; saat sukses keduanya bernilai `"00"`. Lihat FRD §13 untuk katalog error lengkap dan §13.9 untuk katalog `code_client` (draf).
 
 ## Respons Galat Standar
 
