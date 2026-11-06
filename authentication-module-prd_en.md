@@ -90,7 +90,7 @@ Authentication provides the platform capability of **Identity Verification and P
 | Device Trust Establishment | Bind authenticated sessions to verified devices to reduce attack surface |
 | Token Lifecycle Management | Issue, rotate, validate, and revoke proof-of-authentication artifacts |
 | Audit Trail Generation | Emit immutable event records for every authentication event |
-| Account Protection | Detect and respond to credential-based attacks (brute force, stuffing) |
+| Account Protection | Detect and respond to credential-based attacks (brute force, credential stuffing) |
 
 ## 2.3 Problems Solved
 
@@ -126,9 +126,9 @@ Domain Discovery was performed using Event Storming methodology, examining the a
 
 | Actor | Type | Interaction Pattern |
 |---|---|---|
-| Bank Administrator | Human | Web browser via Bank Administration Portal |
-| Corporate User | Human | Web browser via Corporate Portal |
-| Mobile Approver | Human | Native mobile application |
+| Bank Administrator | Human | Web browser via Bank Administration Portal; logs in without a company code (internal bank realm) |
+| Corporate User | Human | Web browser via Corporate Portal; logs in with company code + username |
+| Mobile Approver | Human | Native mobile application; logs in with company code + username |
 | API Client (Machine) | System | OAuth2 Client Credentials flow |
 | Downstream Service | System | Token introspection |
 | Fraud/Risk System | System | Event subscriber |
@@ -161,6 +161,8 @@ Domain Discovery was performed using Event Storming methodology, examining the a
 22. Password reset requested
 23. Password reset completed
 24. Password expired
+25. Account unlocked (automatically or by admin)
+26. Password change forced by admin
 
 ## 3.3 Commands Identified
 
@@ -339,7 +341,9 @@ The single most important architectural decision is the separation between **Aut
 ## 6.2 Detailed Context Relationships
 
 ### Authentication ↔ Identity Context
-**Relationship:** Customer/Supplier (Identity is Upstream). Authentication queries Identity for existence/active status via Anti-Corruption Layer. Authentication defines its own `IdentityRef` value object; Identity schema changes only affect the ACL adapter.
+**Relationship:** Customer/Supplier (Identity is Upstream). Authentication queries Identity to resolve the login identifier into an identity and to check existence/active status, via an Anti-Corruption Layer. Authentication defines its own `IdentityRef` and `LoginIdentifier` value objects; Identity schema changes only affect the ACL adapter.
+
+**Resolution port contract:** `resolveIdentity(LoginIdentifier) -> IdentityRef | NOT_FOUND`, where `LoginIdentifier` = (`company_code`, `username`). The Identity Context owns the corporate→user mapping and enforces `username` uniqueness within a single `company_code`; Authentication never stores or validates that mapping itself. The port returns the same `NOT_FOUND` whether the corporate does not exist or the user does not exist — the caller must not be able to tell them apart.
 
 ### Authentication → Notification Context
 **Relationship:** Authentication is Upstream. Asynchronous events trigger notification delivery (OTP, password reset link, security alerts). Authentication never waits on Notification — a notification failure does not cause authentication to fail.
@@ -370,7 +374,7 @@ Protects invariants: a session cannot be both active and expired; a revoked sess
 ### Aggregate 2: `CredentialAggregate`
 Protects invariants: failed attempt count is always consistent with lockout status; password history depth never exceeds policy maximum; a locked credential cannot be verified.
 
-**Contains:** Credential ID, Identity Reference, Password Hash, Password Salt, Password Algorithm/Version, Password Created/Expires At, Force Password Change flag, Failed Attempt Count, Lockout Status (`UNLOCKED`/`LOCKED_TEMPORARY`/`LOCKED_PERMANENT`), Locked Until, Password History (entity collection).
+**Contains:** Credential ID, Identity Reference, Password Hash, Password Salt, Password Algorithm/Version, Password Created/Expires At, Force Password Change flag, Failed Attempt Count, Lockout Status (`UNLOCKED`/`LOCKED_TEMPORARY`/`LOCKED_PERMANENT`), Locked At, Locked Until, Lockout History Count (cumulative lifetime counter for lockout escalation; never reset), Password History (entity collection).
 
 ### Aggregate 3: `MFAFactor`
 Protects invariants: a factor in `PENDING` state cannot be used for verification; recovery codes are single-use and must be marked consumed atomically.
@@ -400,6 +404,7 @@ Protects invariants: only one token in a family can be `ACTIVE` at a time; once 
 | Value Object | Used In | Why a Value Object |
 |---|---|---|
 | `IdentityRef` | All aggregates | Opaque reference; equality by value |
+| `LoginIdentifier` | Login, Identity ACL | Normalized (`company_code`, `username`) tuple; only meaningful as a whole |
 | `PasswordHash` | CredentialAggregate | Encapsulates Argon2id hashing logic |
 | `DeviceFingerprint` | RegisteredDevice | Computed from attributes; immutable |
 | `AuthenticationAssuranceLevel` | AuthenticationSession | Enum-like; equality by value |
@@ -434,15 +439,28 @@ Protects invariants: only one token in a family can be `ACTIVE` at a time; once 
 
 ## 8.1 Login
 
-**FR-LOGIN-001: Username/Password Authentication**
-Accept a username and password, verify against stored hash using Argon2id, return the authentication result.
+**FR-LOGIN-001: Company Code/Username/Password Authentication**
+Accept a **Company Code**, **Username**, and password. The system resolves the (`company_code`, `username`) pair into a single `identity_id` via the Anti-Corruption Layer to the Identity Context, then verifies the password against the stored hash using Argon2id and returns the authentication result.
+
+**Identifier rules:**
+- `username` is **unique only within the scope of a single `company_code`**. Two different corporates may have identical `username`s. Therefore `username` alone is never sufficient to identify a principal.
+- `company_code` is case-insensitive and normalized (uppercase, trim) before resolution and before being used as a rate-limit key.
+- Identifier resolution must happen **before** password verification, because lockout policy and MFA policy are evaluated per identity.
+
+**Actors without a corporate (Bank Administrator):**
+A Bank Administrator is not owned by any corporate, and logs in via a separate endpoint, `POST /api/v1/auth/admin/login` (§11.1), which has no `company_code` field at all — it is no longer the same field with an "omit or not" choice on one shared endpoint. This endpoint is reachable only by the Bank Administration Portal BFF (verified via mTLS/SPIFFE with an Istio `AuthorizationPolicy`, FRD FR-LOGIN-001a), so corporate users cannot reach the bank admin realm — not because they "leave `company_code` empty", but because they physically cannot reach this endpoint. Omitting `company_code` on `POST /api/v1/auth/login` (corporate) is still `ERR-REQUEST-003` (see §13.0).
+
+**Corporate enumeration prevention:**
+An unknown `company_code` must produce a response, status code, and timing profile identical to a wrong password (see FR-LOGIN-003). The system must not reveal whether a corporate is registered.
 
 **FR-LOGIN-002: Email/Password Authentication (Future-Ready)**
-Architecture must support email as a login identifier without schema changes. Credential lookup must be identifier-type agnostic. Implementation deferred to Phase 2.
+Architecture must support email as a login identifier without schema changes. Credential lookup must be identifier-type agnostic: the resolution port accepts a `LoginIdentifier` value object and does not assume a `username` shape. Implementation deferred to Phase 2.
+
+Because email is globally unique, the Phase 2 email-based flow may omit `company_code`. The rule is determined by identifier type, not by client: `USERNAME` requires `company_code`, `EMAIL` does not.
 
 **FR-LOGIN-003: Failed Login Handling**
 - Increment failed attempt counter on each failure
-- Return a generic error message that does not distinguish between "user not found" and "wrong password"
+- Return a generic error message that does not distinguish between "unknown corporate", "user not found", and "wrong password"
 - Apply configurable lockout policy after N consecutive failures within a time window (default: 5 failures in 15 minutes)
 - Emit `LoginFailed` domain event
 
@@ -453,8 +471,17 @@ Two lockout modes:
 
 Escalation policy (configurable): First lockout → Temporary (30 min); Second → Temporary (2 hours); Third → Permanent.
 
+The escalation tier is determined by `lockout_history_count` on the credential:
+- Initialized to `0` when the credential is created and incremented by 1 every time a new lockout is triggered (at any tier)
+- **Never reset** — neither when a Temporary Lockout expires automatically nor when unlocked by an administrator; it is a cumulative lifetime counter
+- The tier is chosen from the value **before** incrementing: `0` → Temporary 30 minutes; `1` → Temporary 2 hours; `>= 2` → Permanent
+
+On unlock (automatically after `locked_until` has passed, or by an administrator), `failed_attempt_count` is reset to `0` and the `AccountUnlocked` domain event is emitted (see US-003).
+
 **FR-LOGIN-005: Login Audit**
-Every login attempt (success and failure) must be persisted as a `LoginAttempt` record containing: identity_id, timestamp, outcome, failure_reason, ip_address, user_agent, device_fingerprint, session_id (if successful).
+Every login attempt (success and failure) must be persisted as a `LoginAttempt` record containing: identity_id, company_code_used, username_used, timestamp, outcome, failure_reason, ip_address, user_agent, device_fingerprint, session_id (if successful).
+
+`company_code_used` and `username_used` are recorded **as submitted** (after normalization), including when resolution fails and `identity_id` is NULL. Without them, attempts against non-existent corporates cannot be investigated.
 
 **FR-LOGIN-006: Simultaneous Session Policy**
 Configurable policies: Allow all concurrent sessions; Limit N (oldest invalidated); Single session (prior revoked on new login).
@@ -554,7 +581,7 @@ Authenticated user can view all registered devices and revoke any of them.
 - Must contain: uppercase, lowercase, digit, special character
 - Maximum length: 128 characters (DoS prevention)
 - Common password blocklist (minimum 100,000 entries)
-- Username must not be contained in password
+- Username and company code must not be contained in password
 
 **FR-PWD-002: Password History**
 Prevent reuse of last N passwords (default: 12). History entries store hashes only.
@@ -563,7 +590,7 @@ Prevent reuse of last N passwords (default: 12). History entries store hashes on
 Default: 90 days (bank admin), 180 days (corporate users). Warnings at 14, 7, 3, 1 day before expiry. On expiry, user is forced to change password before accessing protected resources.
 
 **FR-PWD-004: Forgot Password**
-1. User submits identifier; system always returns same response (prevents enumeration)
+1. User submits `company_code` and `username`; system always returns the same response, including when the corporate is unknown (prevents both corporate and user enumeration)
 2. If identity exists: generate short-lived single-use reset token (60-minute TTL)
 3. Emit `PasswordResetRequested` event → Notification Context delivers reset link
 
@@ -583,14 +610,19 @@ Default: 90 days (bank admin), 180 days (corporate users). Warnings at 14, 7, 3,
 
 **FR-PWD-007: Admin-Initiated Password Reset**
 Administrator can force password reset for any identity. User must set new password on next login.
+- Sets `force_password_change = TRUE`; the current password can still be used to log in (US-007)
+- Emits `AdminInitiatedPasswordReset` (once; repeating the action while the flag is already set emits no new event)
+- The subsequent password change emits `PasswordChanged` with `change_type = FORCED`
 
 ## 8.6 Token Management
 
 **FR-TOKEN-001: Access Token Structure**
-JWT (RFC 7519) with RS256. Claims: `iss`, `sub` (identity_id), `aud`, `iat`, `exp` (15 min default), `jti`, `session_id`, `aal`, `device_id`, `scope`, `corporate_id`.
+JWT (RFC 7519); the signing algorithm per phase follows FR-TOKEN-002. Claims: `iss`, `sub` (identity_id), `aud`, `iat`, `exp` (15 min default), `jti`, `session_id`, `aal`, `device_id`, `scope`, `corporate_id`.
 
 **FR-TOKEN-002: Access Token Signing**
-RS256 (RSA 2048-bit minimum; RSA 4096-bit preferred). Public key at `/.well-known/jwks.json`. Key rotation every 90 days. Private key in HSM/Vault.
+Phased (see §16.3):
+- **Phase 1 — HS256.** Random secret of at least 32 bytes (256-bit), held only by the Auth Module and the API Gateway (the only JWT verifier in Phase 1). Other downstream services do not verify JWTs themselves; if they need token status, they use introspection (FR-TOKEN-006). `kid` header is mandatory. Secret rotated every 90 days or immediately on incident.
+- **Phase 2 — RS256** (RSA 2048-bit minimum; RSA 4096-bit preferred). Public key at `/.well-known/jwks.json`. Key rotation every 90 days. Private key in HSM/Vault (F-011).
 
 **FR-TOKEN-003: Refresh Token**
 Opaque, cryptographically random (minimum 32 bytes). Store only SHA-256 hash server-side. Lifetime: 24 hours (web), 7 days (mobile). Bound to session.
@@ -605,21 +637,24 @@ RFC 7009 endpoint. Access Token revocation: add `jti` to Redis revocation list (
 **FR-TOKEN-006: Token Introspection**
 RFC 7662 endpoint. Resource servers submit token; receive active status and claims.
 
-**FR-TOKEN-007: JWKS Endpoint**
-Publish signing public keys at `/.well-known/jwks.json` (RFC 7517).
+**FR-TOKEN-007: JWKS Endpoint** *(Phase 2)*
+Publish signing public keys at `/.well-known/jwks.json` (RFC 7517). Not available in Phase 1 because HS256 has no public key.
 
 ---
 
 # 9. User Stories & Acceptance Criteria
 
 ## US-001: Standard Login
-**As a** Corporate User, **I want to** log in with username and password, **So that** I can access the Corporate Portal.
+**As a** Corporate User, **I want to** log in with Company Code, Username, and password, **So that** I can access the Corporate Portal.
 
 **Acceptance Criteria:**
 - Valid credentials return Access Token and Refresh Token within 3 seconds
-- Invalid credentials return generic error (no username/password distinction)
-- 5 consecutive failures within 15 minutes triggers account lockout
-- Every attempt is recorded in the audit log with IP, user agent, and timestamp
+- Invalid credentials return generic error (no company code/username/password distinction)
+- An unknown `company_code` returns an error and response time identical to a wrong password
+- The same `username` in two different corporates resolves to different identities that do not affect each other
+- A request without `company_code` from a corporate client is rejected with 400
+- 5 consecutive failures within 15 minutes triggers account lockout; the lockout is limited to one identity and does not affect the same `username` in another corporate
+- Every attempt is recorded in the audit log with company code, username, IP, user agent, and timestamp
 
 ## US-002: Login with MFA Required
 **As a** Bank Administrator, **I want to** complete MFA after entering my password, **So that** my privileged account is protected by a second factor.
@@ -661,7 +696,7 @@ Publish signing public keys at `/.well-known/jwks.json` (RFC 7517).
 **As a** user who forgot their password, **I want to** reset it via email link, **So that** I can regain access.
 
 **Acceptance Criteria:**
-- Submitting any identifier always shows "if that account exists, you'll receive an email"
+- Submitting any company code/username combination always shows "if that account exists, you'll receive an email"
 - Reset link is single-use and valid for 60 minutes
 - New password must meet password policy
 - All other sessions are invalidated after reset
@@ -697,7 +732,6 @@ Publish signing public keys at `/.well-known/jwks.json` (RFC 7517).
 # 10. Architecture
 
 ## 10.1 Architectural Style
-
 Hexagonal Architecture (Ports and Adapters) + Clean Architecture. Independently deployable microservice.
 
 ```
@@ -710,7 +744,10 @@ Hexagonal Architecture (Ports and Adapters) + Clean Architecture. Independently 
 │  │  (Inbound)   │    │   (Use Cases / Application Services)   │   │
 │  │              │    └────────────────┬───────────────────────┘   │
 │  │ - REST API   │                     │                            │
-│  │ - gRPC       │    ┌────────────────▼───────────────────────┐   │
+│  │   (primary)  │                     │                            │
+│  │ - gRPC (svc- │    ┌────────────────▼───────────────────────┐   │
+│  │   to-svc &   │    │                                        │   │
+│  │   streaming) │    │                                        │   │
 │  │ - Event      │    │               Domain                   │   │
 │  │   Consumer   │    │                Layer                   │   │
 │  └──────────────┘    │   (Aggregates, Domain Services,        │   │
@@ -736,6 +773,9 @@ Hexagonal Architecture (Ports and Adapters) + Clean Architecture. Independently 
 |---|---|---|
 | Runtime | Go 1.22+ | Performance, low memory footprint, single static binary deployment |
 | Framework | stdlib / chi | Minimal overhead, explicit control over middleware and routing |
+| API Protocol (primary) | REST/JSON over HTTPS | All unary (request–response) interactions; easiest to consume for BFFs, mobile apps, and the API gateway |
+| API Protocol (secondary) | gRPC (`grpc-go`) + Protocol Buffers v3 | Unary between backend services (not BFFs) and streaming needs (server, client, bidirectional); see §10.5 |
+| gRPC Contract Tooling | Buf (`buf lint`, `buf breaking`) | Linting and breaking-change detection on `.proto` contracts |
 | Database | PostgreSQL 16 | ACID compliance, strong encryption extensions |
 | Cache / Session | Redis 7 (Cluster) | Low-latency token validation and revocation list |
 | Message Broker | Apache Kafka | Durable, ordered domain event delivery |
@@ -761,11 +801,76 @@ All pods are stateless. State is externalized:
 
 This guarantees at-least-once delivery without distributed transactions.
 
+## 10.5 API Transport Strategy: REST by Default, gRPC for Service-to-Service and Streaming
+
+The Authentication Module **no longer follows a gRPC-first approach**. Transport is chosen by the communication pattern required, not by technology preference.
+
+### 10.5.1 Transport Selection Rules
+
+| Communication Pattern | Transport | Notes |
+|---|---|---|
+| Unary — called by a BFF, the mobile app, or through the API Gateway | **REST/JSON** | Default for every capability. All endpoints in §11 fall into this category. BFFs **must not** use unary gRPC. |
+| Unary — communication between backend services (service-to-service) | REST/JSON or gRPC | Unary gRPC is allowed **only** when the caller is another backend service inside the mesh (e.g. Fraud Context, Corporate Context, other domain services), not a BFF. |
+| Server streaming (one request → many responses) | gRPC | The server pushes a series of messages to the client over a single stream. |
+| Client streaming (many requests → one response) | gRPC | The client sends a series of messages; the server replies with one summary. |
+| Bidirectional streaming (many ↔ many) | gRPC | Both sides send messages independently over a single stream. |
+
+**Decision rules:**
+1. A need consumed by a BFF (Corporate Portal, Bank Administration Portal), the mobile app, or traffic from the API Gateway that can be met with one request and one response **must** be exposed as REST.
+2. A unary need consumed **only** by other backend services may be exposed as unary gRPC. If the same capability is also needed by a BFF, it is still exposed via REST for the BFF; both adapters call the same use case.
+3. gRPC streaming is used when a need inherently requires one of the three streaming patterns above, regardless of the consumer (as long as it is inside the mesh). Short-interval REST polling that loads the system is a signal that the need should move to server streaming.
+
+### 10.5.2 gRPC Delivery Package
+
+Although REST is the primary transport, the module **still ships a gRPC package** as part of the delivery, so that service-to-service unary and streaming needs can be added without reworking the architecture:
+
+```
+auth-service/
+├── api/
+│   ├── openapi/               # REST contract (OpenAPI 3.1) — source of truth for unary
+│   └── proto/auth/v1/         # gRPC contract (.proto) — service-to-service unary + streaming
+├── gen/go/auth/v1/            # Generated stubs (protoc-gen-go, protoc-gen-go-grpc)
+└── internal/
+    ├── adapter/inbound/rest/  # REST primary adapter (chi)
+    ├── adapter/inbound/grpc/  # gRPC primary adapter (grpc-go): server, interceptor, mapper
+    └── application/           # Use cases — shared by both adapters
+```
+
+gRPC package rules:
+1. **Thin adapter** — the gRPC adapter only maps Protobuf messages to application-layer commands/queries, just like the REST adapter. No business logic in adapters; both call the same use cases.
+2. **Versioned contract** — Protobuf packages are named `auth.v1`; incompatible changes must ship in a new versioned package (`auth.v2`). `buf breaking` runs in CI.
+3. **Separate unary and streaming services** — service-to-service unary RPCs live in their own Protobuf `service` (e.g. `auth.v1.InternalAuthService`), separate from the streaming `service`. This separation makes it easier to enforce authorization per caller group (see §10.5.4).
+4. **Unary gRPC closed to BFFs** — unary RPCs may only be called by backend-service SPIFFE IDs on an allowlist. BFF SPIFFE IDs are rejected for all unary RPCs via Istio `AuthorizationPolicy`, and re-checked by a gRPC interceptor (defense in depth).
+5. **gRPC server can be disabled** — the gRPC listener runs on a separate port and is enabled via configuration (`GRPC_ENABLED`). While no RPC is registered, the listener is not started.
+6. **Client stubs are published** — generated Go stubs are published as an internal Go module so consumer services (backend services, the API gateway, and BFFs for streaming RPCs only) do not need to regenerate them.
+
+### 10.5.3 Candidate gRPC RPCs (Illustrative)
+
+The list below is **not a scope commitment** for this release; it only illustrates needs that justify using gRPC:
+
+| Pattern | Candidate RPC | Consumer | Purpose |
+|---|---|---|---|
+| Unary (service-to-service) | `ForceLogout` | Fraud Context | Force logout of all of a principal's sessions when fraud is detected (inbound command from Fraud, see §6) |
+| Unary (service-to-service) | `LockAccount` | Fraud Context | Account lock on instruction from the Fraud Context |
+| Unary (service-to-service) | `GetSessionContext` | Backend domain services | Fetch session context (principal, AAL, authentication method) for authorization decisions in other services |
+| Server streaming | `WatchSessionRevocations` | BFF, API Gateway | Push session/token revocation notifications (force logout from Fraud Context, user revocation) in real time without polling |
+| Server streaming | `WatchMfaChallenge` | Corporate Portal BFF | Wait for the push-MFA approval result from the Mobile Approval app without long-polling |
+| Client streaming | `BulkRevokeSessions` | Bank Administration Portal (via BFF) | Upload a large list of sessions/users to revoke, answered with one result summary |
+| Bidirectional streaming | `ValidateTokens` | API Gateway | Long-lived, low-latency token validation/introspection channel, reducing per-request overhead |
+
+### 10.5.4 gRPC Security and Error Handling
+
+- **Mesh-internal only** — gRPC endpoints are not exposed to the internet or the mobile app. Caller identity is proven via Istio mTLS peer identity (SPIFFE ID) and enforced by `AuthorizationPolicy`, the same as the BFF login endpoints in §11.1.
+- **Authorization per caller group** — the service-to-service unary `service` only allows backend-service SPIFFE IDs on the allowlist; BFF SPIFFE IDs are rejected. The streaming `service` allows the consumers listed in §10.5.3, including BFFs.
+- **Error code parity** — errors map to standard gRPC status codes (`INVALID_ARGUMENT`, `UNAUTHENTICATED`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `INTERNAL`, etc.), with the same `code`, `code_client`, and `trace_id` as REST carried in `google.rpc.ErrorInfo` (`metadata` field). The error catalog still refers to FRD §13.
+- **Stream management** — every stream must have a lifetime limit (max connection age), keepalive, and a limit on concurrent streams per caller, so long-lived streams neither block rolling deployments nor exhaust pod resources.
+- **Observability** — OpenTelemetry interceptors are installed for all RPCs; per-stream metrics (duration, message count, close reason) are recorded separately from REST metrics.
+
 ---
 
 # 11. REST API Design
 
-All APIs: JSON, versioned under `/api/v1/auth`, HTTPS required. Errors conform to RFC 7807, minus the `status` field. HTTP transport status is 200 for all business-logic errors (invalid credentials, account not found, locked account, bad request body, etc.); only `ERR-SESSION-002`/`ERR-TOKEN-004` (verified via API gateway token introspection), the 429 rate-limit family, and 5xx system errors keep their real HTTP status. Every response body — success or error — carries top-level `code` and `code_client` fields; on success both are `"00"`. See FRD §13 for the full error catalog and §13.9 for the `code_client` catalog (draft).
+REST is the primary transport for all unary operations of this module and the only unary transport BFFs may use (see §10.5); gRPC contracts exist only for service-to-service unary between backend services and for streaming needs. All APIs: JSON, versioned under `/api/v1/auth`, HTTPS required. Errors conform to RFC 7807, minus the `status` field. HTTP transport status is 200 for all business-logic errors (invalid credentials, account not found, locked account, bad request body, etc.); only `ERR-SESSION-002`/`ERR-TOKEN-004` (verified via API gateway token introspection), the 429 rate-limit family, and 5xx system errors keep their real HTTP status. Every response body — success or error — carries top-level `code` and `code_client` fields; on success both are `"00"`. See FRD §13 for the full error catalog and §13.9 for the `code_client` catalog (draft).
 
 ## Standard Error Response
 
@@ -790,15 +895,16 @@ Login is split into **three distinct endpoints**, one per calling client, each w
 | Endpoint | Caller | Client identity established via |
 |---|---|---|
 | `POST /api/v1/auth/login` | Corporate Portal BFF (Go service, in-mesh) | Istio mTLS peer identity (SPIFFE ID), enforced by `AuthorizationPolicy`. Does not accept a `client_id` field. |
-| `POST /api/v1/auth/admin/login` | Bank Administration Portal BFF (Go service, in-mesh) | Istio mTLS peer identity (SPIFFE ID), enforced by `AuthorizationPolicy`. Does not accept a `client_id` field. |
-| `POST /api/v1/auth/mobile/login` | Mobile Approval app (native, outside the mesh) | Self-declared `client_id` field — unauthenticated. See FRD BR-013 for the resulting constraint on its use. |
+| `POST /api/v1/auth/admin/login` | Bank Administration Portal BFF (Go service, in-mesh) | Istio mTLS peer identity (SPIFFE ID), enforced by `AuthorizationPolicy`. Does not accept a `client_id` field. Does not accept `company_code` — resolution is always in the internal bank realm. |
+| `POST /api/v1/auth/mobile/login` | Mobile Approval app (native, outside the mesh) | Self-declared `client_id` field — **unauthenticated**. See FRD BR-013 for the resulting constraint on its use. |
 
 ### POST /api/v1/auth/login
 
 **Request:**
 ```json
 {
-  "identifier": "john.smith",
+  "company_code": "ACME01",
+  "username": "john.smith",
   "password": "S3cur3P@ssword!",
   "device_fingerprint": {
     "user_agent": "Mozilla/5.0...",
@@ -838,7 +944,8 @@ Login is split into **three distinct endpoints**, one per calling client, each w
 }
 ```
 
-**Response 200 (code: ERR-LOGIN-001):** Generic invalid credentials error.
+**Response 200 (code: ERR-REQUEST-003):** `company_code` missing, or identifier format invalid.
+**Response 200 (code: ERR-LOGIN-001):** Generic invalid credentials error — returned identically for an unknown company code, an unknown username, and a wrong password.
 **Response 200 (code: ERR-LOGIN-003):** Account locked (includes `locked_until`).
 **Response 429 (code: ERR-RATE-001):** Rate limited (includes `retry_after`).
 
@@ -849,7 +956,7 @@ Login is split into **three distinct endpoints**, one per calling client, each w
 **Request:**
 ```json
 {
-  "identifier": "admin.jane",
+  "username": "admin.jane",
   "password": "S3cur3P@ssword!",
   "device_fingerprint": {
     "user_agent": "Mozilla/5.0...",
@@ -860,6 +967,8 @@ Login is split into **three distinct endpoints**, one per calling client, each w
   }
 }
 ```
+
+There is no `company_code` field — a Bank Administrator is not owned by any corporate, and resolution is always in the internal bank realm (no longer determined by whether the field is present, but because this endpoint exists specifically for that).
 
 **Response 200 — MFA not required / required:** same shape as `/auth/login` above.
 **Response 200 (code: ERR-LOGIN-001):** Generic invalid credentials error.
@@ -875,7 +984,8 @@ Login is split into **three distinct endpoints**, one per calling client, each w
 **Request:**
 ```json
 {
-  "identifier": "john.smith",
+  "company_code": "ACME01",
+  "username": "john.smith",
   "password": "S3cur3P@ssword!",
   "device_fingerprint": {
     "user_agent": "Mozilla/5.0...",
@@ -987,7 +1097,7 @@ Triggers delivery of the same OTP code via WhatsApp, as an alternative channel t
 
 **Response 200 — Inactive:** `{ "active": false }`
 
-### GET /.well-known/jwks.json
+### GET /.well-known/jwks.json *(Phase 2)*
 
 Returns current and previous signing public keys in JWK Set format.
 
@@ -1031,8 +1141,8 @@ Revokes device and all associated sessions. Returns 204.
 **Response 200 (code: ERR-PWD-001..009):** New password violates policy.
 
 ### POST /api/v1/auth/password/forgot
-**Request:** `{ "identifier": "john.smith" }`
-**Response:** Always 200 with generic message, `"code": "00", "code_client": "00"` (prevents account enumeration).
+**Request:** `{ "company_code": "ACME01", "username": "john.smith" }`
+**Response:** Always 200 with generic message — including when `company_code` is unknown — with `"code": "00", "code_client": "00"` (prevents account enumeration).
 
 ### POST /api/v1/auth/password/reset
 **Request:** `{ "reset_token": "...", "new_password": "..." }`
@@ -1083,6 +1193,7 @@ CREATE TABLE credentials (
     lockout_status        VARCHAR(32) NOT NULL DEFAULT 'UNLOCKED',
     locked_at             TIMESTAMPTZ,
     locked_until          TIMESTAMPTZ,
+    lockout_history_count INT NOT NULL DEFAULT 0, -- cumulative lifetime; never reset (FR-LOGIN-004)
     created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -1099,6 +1210,7 @@ CREATE TABLE password_history (
     password_hash  VARCHAR(255) NOT NULL,
     password_salt  VARCHAR(64) NOT NULL,
     algorithm      VARCHAR(32) NOT NULL,
+    password_version INT NOT NULL DEFAULT 1,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX idx_password_history_credential ON password_history(credential_id, created_at DESC);
@@ -1255,7 +1367,8 @@ CREATE UNIQUE INDEX idx_devices_fingerprint ON registered_devices(identity_id, f
 CREATE TABLE login_attempts (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     identity_id         UUID,
-    identifier_used     VARCHAR(256) NOT NULL,
+    company_code_used   VARCHAR(64),
+    username_used       VARCHAR(256) NOT NULL,
     outcome             VARCHAR(32) NOT NULL,
     failure_reason      VARCHAR(64),
     session_id          UUID REFERENCES authentication_sessions(id),
@@ -1268,6 +1381,7 @@ CREATE TABLE login_attempts (
 ) PARTITION BY RANGE (attempted_at);
 
 CREATE INDEX idx_login_attempts_identity ON login_attempts(identity_id, attempted_at DESC);
+CREATE INDEX idx_login_attempts_company ON login_attempts(company_code_used, attempted_at DESC);
 CREATE INDEX idx_login_attempts_ip ON login_attempts(ip_address, attempted_at DESC);
 CREATE INDEX idx_login_attempts_outcome ON login_attempts(outcome, attempted_at DESC);
 ```
@@ -1350,6 +1464,7 @@ All events published to Kafka with envelope:
 ```json
 {
   "identity_id": "identity_01H9XZ...",
+  "company_code": "ACME01",
   "session_id": "sess_01H9XZ...",
   "device_id": "dev_xyz789...",
   "is_new_device": false,
@@ -1370,6 +1485,7 @@ All events published to Kafka with envelope:
 ```json
 {
   "identity_id": "identity_01H9XZ...",
+  "company_code": "ACME01",
   "failure_reason": "INVALID_CREDENTIALS",
   "failed_attempt_count": 3,
   "ip_address": "203.0.113.42",
@@ -1379,7 +1495,11 @@ All events published to Kafka with envelope:
 }
 ```
 
-Failure reasons: `INVALID_CREDENTIALS`, `ACCOUNT_LOCKED`, `ACCOUNT_NOT_FOUND`, `INVALID_MFA_CODE`, `MFA_SESSION_EXPIRED`, `ACCOUNT_INACTIVE`
+`identity_id` is null when identifier resolution fails; `company_code` is still populated as submitted so the Fraud Context can detect cross-corporate sweeping.
+
+Failure reasons: `INVALID_CREDENTIALS`, `ACCOUNT_LOCKED`, `ACCOUNT_NOT_FOUND`, `UNKNOWN_COMPANY_CODE`, `INVALID_MFA_CODE`, `MFA_SESSION_EXPIRED`, `ACCOUNT_INACTIVE`
+
+`UNKNOWN_COMPANY_CODE` is internal: it is recorded in events and audit, but never reflected in the API response (see FR-LOGIN-003).
 
 ## 13.3 AccountLocked
 
@@ -1397,6 +1517,8 @@ Failure reasons: `INVALID_CREDENTIALS`, `ACCOUNT_LOCKED`, `ACCOUNT_NOT_FOUND`, `
   "occurred_at": "2026-06-30T09:00:00Z"
 }
 ```
+
+`lockout_type` values: `TEMPORARY`, `PERMANENT` (`locked_until` is null). This is the public event contract; internally the domain uses `lockout_status` (`LOCKED_TEMPORARY`/`LOCKED_PERMANENT`), and the mapping `LOCKED_TEMPORARY → TEMPORARY`, `LOCKED_PERMANENT → PERMANENT` happens when the event is serialized to the outbox — not inside the domain.
 
 ## 13.4 SessionCreated
 
@@ -1450,6 +1572,8 @@ Revoke reasons: `USER_LOGOUT`, `ADMIN_FORCE_LOGOUT`, `PASSWORD_CHANGED`, `PASSWO
   "occurred_at": "2026-06-30T10:00:00Z"
 }
 ```
+
+Change types: `USER_INITIATED` (voluntary change), `FORCED` (when `force_password_change` is set because of `AdminInitiatedPasswordReset`, or the password has expired).
 
 ## 13.7 PasswordResetRequested
 
@@ -1544,6 +1668,37 @@ Revoke reasons: `USER_LOGOUT`, `ADMIN_FORCE_LOGOUT`, `PASSWORD_CHANGED`, `PASSWO
   "suspicious_ip": "198.51.100.42",
   "tokens_revoked_count": 4,
   "occurred_at": "2026-06-30T11:00:00Z"
+}
+```
+
+## 13.15 AccountUnlocked
+
+**Business Meaning:** An identity's credential lockout has been lifted — either automatically because a Temporary Lockout expired, or by an administrator (`UnlockAccount` command). The principal can authenticate again.
+**Producer:** CredentialAggregate
+**Consumers:** Audit, Fraud/Risk
+
+```json
+{
+  "identity_id": "identity_01H9XZ...",
+  "unlocked_by": "identity_admin01...",
+  "previous_lockout_type": "PERMANENT",
+  "occurred_at": "2026-06-30T12:00:00Z"
+}
+```
+
+`unlocked_by` is null for automatic unlocks; for automatic unlocks `occurred_at` is the `locked_until` value (the moment the lock actually ended), not the time it was detected. `lockout_history_count` is not changed by an unlock. `previous_lockout_type` uses the same values and mapping as `lockout_type` in AccountLocked (§13.3).
+
+## 13.16 AdminInitiatedPasswordReset
+
+**Business Meaning:** An administrator requires an identity to change its password at next login (FR-PWD-007). The current password is not yet invalidated.
+**Producer:** CredentialAggregate
+**Consumers:** Audit, Notification
+
+```json
+{
+  "identity_id": "identity_01H9XZ...",
+  "initiated_by": "identity_admin01...",
+  "occurred_at": "2026-06-30T12:00:00Z"
 }
 ```
 
@@ -1690,14 +1845,26 @@ sequenceDiagram
     participant AP as API Gateway
     participant AS as Auth Service
     participant CR as Credentials DB
+    participant ID as Identity Context
     participant SD as Session DB
     participant RD as Redis
     participant KB as Kafka (Outbox)
 
-    U->>AP: POST /auth/login {identifier, password, device_fp}
+    U->>AP: POST /auth/login {company_code, username, password, device_fp}
     AP->>AS: Forward request (rate limit checked at gateway)
-    AS->>RD: Check rate limit for IP + identifier
+    AS->>AS: Normalize company_code (realm already determined by the endpoint called + mTLS peer identity, no longer client_id — see FRD FR-LOGIN-001a)
+    AS->>RD: Check rate limit for IP + company_code + username
     RD-->>AS: OK
+    AS->>ID: resolveIdentity(company_code, username) via ACL
+    alt Not resolved (unknown corporate/user)
+        ID-->>AS: NOT_FOUND
+        AS->>AS: Run dummy hash verification (constant response time)
+        AS->>KB: Publish LoginFailed (outbox, identity_id null)
+        AS-->>AP: 200 (ERR-LOGIN-002)
+        AP-->>U: 200 (ERR-LOGIN-002)
+    else Resolved
+        ID-->>AS: identity_id
+    end
     AS->>CR: Find credential by identity_id
     CR-->>AS: Credential record
     AS->>AS: Verify password hash (Argon2id)
@@ -1710,7 +1877,7 @@ sequenceDiagram
         AS->>AS: Evaluate device fingerprint
         AS->>SD: Create AuthenticationSession
         AS->>SD: Create RefreshTokenFamily + RefreshToken
-        AS->>AS: Sign Access Token (JWT, RS256)
+        AS->>AS: Sign Access Token (JWT, HS256 Phase 1 / RS256 Phase 2)
         AS->>KB: Publish LoginSucceeded + SessionCreated + RefreshTokenIssued (outbox)
         AS-->>AP: 200 {access_token, refresh_token, session_id}
         AP-->>U: 200 OK
@@ -1729,8 +1896,9 @@ sequenceDiagram
     participant RD as Redis
     participant KB as Kafka
 
-    U->>AP: POST /auth/login {identifier, password}
+    U->>AP: POST /auth/login {company_code, username, password}
     AP->>AS: Forward request
+    AS->>AS: Resolve (company_code, username) -> identity_id via ACL
     AS->>CR: Verify password
     CR-->>AS: Valid
     AS->>MFA: Check active MFA factors
@@ -1834,9 +2002,9 @@ sequenceDiagram
     participant KB as Kafka
     participant NF as Notification Context
 
-    U->>AP: POST /auth/password/forgot {identifier}
+    U->>AP: POST /auth/password/forgot {company_code, username}
     AP->>AS: Forward request
-    AS->>ID: Lookup identity by identifier (ACL)
+    AS->>ID: resolveIdentity(company_code, username) via ACL
     alt Identity not found
         AS->>AS: Log attempt; no further action
     else Identity found
@@ -1992,18 +2160,26 @@ Authentication Module acts as an OpenID Provider (OP). Endpoints:
 - ID Token: JWT with identity claims alongside Access Token
 - UserInfo: `GET /oidc/userinfo`
 - Discovery: `GET /.well-known/openid-configuration`
-- JWKS: `GET /.well-known/jwks.json`
+- JWKS: `GET /.well-known/jwks.json` (Phase 2)
 
 **Why OIDC vs bespoke:** Standards compliance reduces integration friction and enables future SSO federation.
 
 ## 16.3 JWT (Access Token)
 
-**Algorithm: RS256** (RSASSA-PKCS1-v1_5 with SHA-256)
+**Algorithm: HS256 in Phase 1, RS256 (RSASSA-PKCS1-v1_5 with SHA-256) in Phase 2**
 
 **RS256 vs HS256:**
 - RS256: private key only in Auth Module; any downstream service verifies with public key only. No shared secret to distribute.
-- HS256: requires sharing signing secret with every downstream service. One compromised service exposes all tokens.
-- **Decision: RS256 mandatory.**
+- HS256: requires sharing the signing secret with every verifier. One compromised verifier exposes all tokens.
+- **Decision: RS256 mandatory as the end state (Phase 2).**
+
+**Phase 1 exception — HS256:**
+To simplify early operations (no keypair, JWKS, or Vault Transit management), Phase 1 uses HS256. This exception is valid only because **the API Gateway is the only JWT verifier**, so the secret is shared with exactly one party outside the Auth Module, not with every downstream service. Conditions that must hold throughout Phase 1:
+- Cryptographically random secret of ≥ 32 bytes; must never be committed to a repository or baked into an image.
+- No service other than the API Gateway verifies JWTs locally. A new service that needs to do so triggers an accelerated migration to RS256.
+- `kid` header mandatory on every token. Verifiers pin the algorithm per `kid` and do not trust the `alg` from the token header (prevents *algorithm confusion* while HS256 and RS256 are active at the same time).
+
+**Migration to RS256 (F-011):** API Gateway configured to accept both the old HS256 `kid` and the new RS256 `kid` → Auth Module switches to RS256 → after ≥ the Access Token lifetime (15 minutes) and Restricted Token lifetime, the HS256 `kid` is removed from the Gateway and the secret destroyed.
 
 **ES256 (ECDSA P-256) is an acceptable alternative** with shorter signatures and equivalent security. RS256 recommended initially for broader library support.
 
@@ -2023,7 +2199,8 @@ Required for all Authorization Code flows (RFC 7636). `code_challenge = SHA-256(
 
 | Secret Type | Storage | Rotation |
 |---|---|---|
-| JWT Signing Private Key | Vault Transit Engine (HSM-backed) | Every 90 days |
+| JWT signing HS256 secret (Phase 1) | Secret configuration of the Auth Module + API Gateway (not in repository/image) | Every 90 days or on incident |
+| JWT signing private key (Phase 2) | Vault Transit Engine (HSM-backed) | Every 90 days |
 | Database credentials | Vault Dynamic Secrets | Every 1 hour |
 | TOTP factor secrets | AES-256-GCM (key in Vault) | On demand |
 | Client secrets | Vault KV v2 | Per incident |
@@ -2055,11 +2232,14 @@ For browser-based clients:
 | API Gateway | 100 requests | 1 minute | IP address |
 | Login endpoint | 10 attempts | 5 minutes | IP address |
 | Login endpoint | 5 attempts | 15 minutes | Identity + IP |
-| OTP resend (`/mfa/otp/sms` + `/mfa/otp/wa` combined) | 3 sends | 10 minutes | Identity |
-| Password reset | 3 requests | 60 minutes | Identifier (hashed) |
+| Login endpoint | 20 attempts | 15 minutes | `company_code` + IP (username sweeping) |
+| OTP resend | 3 sends | 10 minutes | Identity |
+| Password reset | 3 requests | 60 minutes | `company_code` + `username` (hashed) |
 | Token introspection | 1000 requests | 1 minute | Resource server client_id |
 
 Redis-backed sliding window counters. Returns `429 Too Many Requests` with `Retry-After` header.
+
+**Tenant isolation:** Every rate-limit and lockout key that includes a user identifier must include `company_code`. Without it, an attacker guessing a common `username` (e.g. `admin`) could lock out same-named accounts across all corporates at once — one tenant could cause a denial of service for other tenants.
 
 ## 16.10 Device Fingerprinting
 
@@ -2104,7 +2284,7 @@ Phase 1: static rules. Phase 2: ML-based risk scoring from Fraud Context.
 
 | Decision | Choice | Rationale | Trade-off |
 |---|---|---|---|
-| Token signing | RS256 | No shared secret with consumers | Larger key size than EC |
+| Token signing | HS256 (Phase 1) → RS256 (Phase 2) | Phase 1: simple operations, single verifier (API Gateway). Phase 2: no shared secret with consumers | Phase 1: secret held by two parties; Phase 2: larger key size than EC |
 | Password hashing | Argon2id | Memory-hard; best GPU attack resistance | Higher CPU/memory per verify |
 | Refresh Token storage | Server-side (hashed) | Immediate revocability | DB lookup on every refresh |
 | Refresh Token rotation | Full rotation with reuse detection | Detects theft | More DB writes |
@@ -2244,7 +2424,7 @@ The 300ms hash time is intentional: makes brute-force computationally expensive 
 
 **Risk:** Compromised RSA private key allows issuance of arbitrary valid tokens.
 **Likelihood:** Very Low | **Impact:** Critical
-**Mitigation:** Signing performed inside Vault Transit Engine (private key never in application memory); immediate key rotation capability; short AT lifetime (15 min); token introspection for real-time revocation.
+**Mitigation:** Signing performed inside Vault Transit Engine (private key never in application memory); immediate key rotation capability; short AT lifetime (15 min); token introspection for real-time revocation. *(Applies to Phase 2; for Phase 1 see R-008.)*
 
 ## R-005: Session Fixation
 
@@ -2263,6 +2443,12 @@ The 300ms hash time is intentional: makes brute-force computationally expensive 
 **Risk:** Audit logs modified or deleted to cover a security breach.
 **Likelihood:** Medium | **Impact:** High
 **Mitigation:** Audit events emitted to append-only Kafka topic simultaneously with DB writes; Kafka data replicated, retained 365 days, write-only for Auth Service; hash chaining on audit records (tampering is detectable).
+
+## R-008: HS256 Secret Leak in Phase 1
+
+**Risk:** The HS256 secret is held by both the Auth Module and the API Gateway; a leak from either allows forging valid Access Tokens and Restricted Tokens.
+**Likelihood:** Low | **Impact:** Critical
+**Mitigation:** Verification limited to the API Gateway only (no distribution to downstream services); secret ≥ 32 bytes, stored as secret configuration and never committed; `kid` header enables immediate rotation; short AT lifetime (15 min); the `jti` revocation list and introspection still apply. Risk closed by the migration to RS256 (F-011).
 
 ---
 
@@ -2299,6 +2485,9 @@ Adjust session and refresh token lifetimes based on risk score — high-risk con
 
 **F-010: OpenID Connect Discovery**
 Publish complete `.well-known/openid-configuration` document for auto-configuration of OIDC clients.
+
+**F-011: JWT Signing Migration from HS256 to RS256**
+Replace the Phase 1 HS256 secret with RS256 whose private key lives in the Vault Transit Engine (HSM-backed), publish JWKS (FR-TOKEN-007), and allow downstream services to verify tokens locally. `kid`-based cutover per §16.3; closes R-008.
 
 ---
 
