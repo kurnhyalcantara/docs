@@ -616,10 +616,12 @@ Administrator dapat memaksa reset kata sandi untuk identitas mana pun. Pengguna 
 ## 8.6 Manajemen Token
 
 **FR-TOKEN-001: Struktur Access Token**
-JWT (RFC 7519) dengan RS256. Klaim: `iss`, `sub` (identity_id), `aud`, `iat`, `exp` (default 15 menit), `jti`, `session_id`, `aal`, `device_id`, `scope`, `corporate_id`.
+JWT (RFC 7519); algoritma penandatanganan per fase mengikuti FR-TOKEN-002. Klaim: `iss`, `sub` (identity_id), `aud`, `iat`, `exp` (default 15 menit), `jti`, `session_id`, `aal`, `device_id`, `scope`, `corporate_id`.
 
 **FR-TOKEN-002: Penandatanganan Access Token**
-RS256 (RSA minimum 2048-bit; RSA 4096-bit lebih disukai). Kunci publik di `/.well-known/jwks.json`. Rotasi kunci setiap 90 hari. Kunci privat berada di HSM/Vault.
+Bertahap (lihat §16.3):
+- **Fase 1 — HS256.** Secret acak minimum 32 byte (256-bit), hanya dipegang Auth Module dan API Gateway (satu-satunya verifier JWT pada Fase 1). Layanan hilir lain tidak memverifikasi JWT sendiri; bila butuh status token, gunakan introspeksi (FR-TOKEN-006). Header `kid` wajib. Rotasi secret setiap 90 hari atau segera saat insiden.
+- **Fase 2 — RS256** (RSA minimum 2048-bit; RSA 4096-bit lebih disukai). Kunci publik di `/.well-known/jwks.json`. Rotasi kunci setiap 90 hari. Kunci privat berada di HSM/Vault (F-011).
 
 **FR-TOKEN-003: Refresh Token**
 Opak, acak kriptografis (minimum 32 byte). Hanya hash SHA-256 yang disimpan di sisi server. Masa berlaku: 24 jam (web), 7 hari (mobile). Terikat pada sesi.
@@ -634,8 +636,8 @@ Endpoint RFC 7009. Pencabutan Access Token: tambahkan `jti` ke daftar pencabutan
 **FR-TOKEN-006: Introspeksi Token**
 Endpoint RFC 7662. Resource server mengirimkan token; menerima status aktif dan klaimnya.
 
-**FR-TOKEN-007: Endpoint JWKS**
-Mempublikasikan kunci publik penandatanganan di `/.well-known/jwks.json` (RFC 7517).
+**FR-TOKEN-007: Endpoint JWKS** *(Fase 2)*
+Mempublikasikan kunci publik penandatanganan di `/.well-known/jwks.json` (RFC 7517). Tidak tersedia pada Fase 1 karena HS256 tidak memiliki kunci publik.
 
 ---
 
@@ -1094,7 +1096,7 @@ Memicu pengiriman kode OTP yang sama via WhatsApp, sebagai alternatif kanal dari
 
 **Response 200 — Tidak aktif:** `{ "active": false }`
 
-### GET /.well-known/jwks.json
+### GET /.well-known/jwks.json *(Fase 2)*
 
 Mengembalikan kunci publik penandatanganan saat ini dan sebelumnya dalam format JWK Set.
 
@@ -1875,7 +1877,7 @@ sequenceDiagram
         AS->>AS: Evaluasi sidik jari perangkat
         AS->>SD: Buat AuthenticationSession
         AS->>SD: Buat RefreshTokenFamily + RefreshToken
-        AS->>AS: Tanda tangani Access Token (JWT, RS256)
+        AS->>AS: Tanda tangani Access Token (JWT, HS256 Fase 1 / RS256 Fase 2)
         AS->>KB: Publikasikan LoginSucceeded + SessionCreated + RefreshTokenIssued (outbox)
         AS-->>AP: 200 {access_token, refresh_token, session_id}
         AP-->>U: 200 OK
@@ -2158,18 +2160,26 @@ Modul Autentikasi berperan sebagai OpenID Provider (OP). Endpoint:
 - ID Token: JWT berisi klaim identitas bersama Access Token
 - UserInfo: `GET /oidc/userinfo`
 - Discovery: `GET /.well-known/openid-configuration`
-- JWKS: `GET /.well-known/jwks.json`
+- JWKS: `GET /.well-known/jwks.json` (Fase 2)
 
 **Mengapa OIDC dibanding solusi khusus:** Kepatuhan pada standar mengurangi hambatan integrasi dan memungkinkan federasi SSO di masa depan.
 
 ## 16.3 JWT (Access Token)
 
-**Algoritma: RS256** (RSASSA-PKCS1-v1_5 dengan SHA-256)
+**Algoritma: HS256 pada Fase 1, RS256 (RSASSA-PKCS1-v1_5 dengan SHA-256) pada Fase 2**
 
 **RS256 vs HS256:**
 - RS256: kunci privat hanya ada di Auth Module; layanan hilir mana pun memverifikasi hanya dengan kunci publik. Tidak ada rahasia bersama yang perlu didistribusikan.
-- HS256: mengharuskan berbagi rahasia penandatanganan ke setiap layanan hilir. Satu layanan yang terkompromi membuka seluruh token.
-- **Keputusan: RS256 wajib.**
+- HS256: mengharuskan berbagi rahasia penandatanganan ke setiap verifier. Satu verifier yang terkompromi membuka seluruh token.
+- **Keputusan: RS256 wajib sebagai target akhir (Fase 2).**
+
+**Pengecualian Fase 1 — HS256:**
+Untuk menyederhanakan operasional awal (tanpa pengelolaan keypair, JWKS, dan Vault Transit), Fase 1 memakai HS256. Pengecualian ini hanya sah karena **API Gateway adalah satu-satunya verifier JWT**, sehingga secret dibagikan ke tepat satu pihak di luar Auth Module, bukan ke setiap layanan hilir. Syarat yang wajib dipenuhi selama Fase 1:
+- Secret acak kriptografis ≥ 32 byte; tidak boleh di-commit ke repositori atau dimasukkan ke image.
+- Tidak ada layanan selain API Gateway yang memverifikasi JWT secara lokal. Layanan baru yang membutuhkannya memicu percepatan migrasi ke RS256.
+- Header `kid` wajib di setiap token. Verifier mengunci algoritma per `kid` dan tidak memercayai `alg` dari header token (mencegah *algorithm confusion* saat HS256 dan RS256 aktif bersamaan).
+
+**Migrasi ke RS256 (F-011):** API Gateway dikonfigurasi menerima `kid` HS256 lama dan `kid` RS256 baru → Auth Module berpindah ke RS256 → setelah ≥ masa berlaku Access Token (15 menit) dan Restricted Token, `kid` HS256 dicabut dari Gateway dan secret dimusnahkan.
 
 **ES256 (ECDSA P-256) merupakan alternatif yang dapat diterima** dengan tanda tangan lebih pendek dan tingkat keamanan setara. RS256 direkomendasikan pada tahap awal karena dukungan pustaka yang lebih luas.
 
@@ -2189,7 +2199,8 @@ Wajib untuk seluruh alur Authorization Code (RFC 7636). `code_challenge = SHA-25
 
 | Tipe Rahasia | Penyimpanan | Rotasi |
 |---|---|---|
-| Kunci privat penandatangan JWT | Vault Transit Engine (didukung HSM) | Setiap 90 hari |
+| Secret HS256 penandatangan JWT (Fase 1) | Konfigurasi rahasia Auth Module + API Gateway (tidak di repositori/image) | Setiap 90 hari atau saat insiden |
+| Kunci privat penandatangan JWT (Fase 2) | Vault Transit Engine (didukung HSM) | Setiap 90 hari |
 | Kredensial basis data | Vault Dynamic Secrets | Setiap 1 jam |
 | Secret faktor TOTP | AES-256-GCM (kunci di Vault) | Sesuai kebutuhan |
 | Client secret | Vault KV v2 | Per insiden |
@@ -2273,7 +2284,7 @@ Fase 1: aturan statis. Fase 2: penilaian risiko berbasis ML dari Fraud Context.
 
 | Keputusan | Pilihan | Alasan | Trade-off |
 |---|---|---|---|
-| Penandatanganan token | RS256 | Tidak ada rahasia bersama dengan konsumen | Ukuran kunci lebih besar dibanding EC |
+| Penandatanganan token | HS256 (Fase 1) → RS256 (Fase 2) | Fase 1: operasional sederhana, verifier tunggal (API Gateway). Fase 2: tidak ada rahasia bersama dengan konsumen | Fase 1: secret dipegang dua pihak; Fase 2: ukuran kunci lebih besar dibanding EC |
 | Hashing kata sandi | Argon2id | Memory-hard; ketahanan terbaik terhadap serangan GPU | CPU/memori lebih tinggi per verifikasi |
 | Penyimpanan Refresh Token | Sisi server (di-hash) | Dapat dicabut seketika | Perlu lookup DB pada setiap refresh |
 | Rotasi Refresh Token | Rotasi penuh dengan deteksi penggunaan ulang | Mendeteksi pencurian | Lebih banyak penulisan DB |
@@ -2413,7 +2424,7 @@ Waktu hash 300 ms bersifat disengaja: membuat brute force mahal secara komputasi
 
 **Risiko:** Kunci privat RSA yang terkompromi memungkinkan penerbitan token valid secara sembarang.
 **Kemungkinan:** Sangat Rendah | **Dampak:** Kritis
-**Mitigasi:** Penandatanganan dilakukan di dalam Vault Transit Engine (kunci privat tidak pernah berada di memori aplikasi); kemampuan rotasi kunci seketika; masa berlaku AT yang pendek (15 menit); introspeksi token untuk pencabutan real-time.
+**Mitigasi:** Penandatanganan dilakukan di dalam Vault Transit Engine (kunci privat tidak pernah berada di memori aplikasi); kemampuan rotasi kunci seketika; masa berlaku AT yang pendek (15 menit); introspeksi token untuk pencabutan real-time. *(Berlaku Fase 2; untuk Fase 1 lihat R-008.)*
 
 ## R-005: Session Fixation
 
@@ -2432,6 +2443,12 @@ Waktu hash 300 ms bersifat disengaja: membuat brute force mahal secara komputasi
 **Risiko:** Log audit diubah atau dihapus untuk menutupi pelanggaran keamanan.
 **Kemungkinan:** Sedang | **Dampak:** Tinggi
 **Mitigasi:** Peristiwa audit dipancarkan ke topik Kafka append-only bersamaan dengan penulisan DB; data Kafka direplikasi, disimpan 365 hari, dan write-only bagi Auth Service; hash chaining pada catatan audit (perusakan dapat terdeteksi).
+
+## R-008: Kebocoran Secret HS256 pada Fase 1
+
+**Risiko:** Secret HS256 dipegang oleh Auth Module dan API Gateway; kebocoran dari salah satunya memungkinkan pemalsuan Access Token dan Restricted Token yang valid.
+**Kemungkinan:** Rendah | **Dampak:** Kritis
+**Mitigasi:** Verifier dibatasi hanya API Gateway (tidak ada distribusi ke layanan hilir); secret ≥ 32 byte, disimpan sebagai konfigurasi rahasia dan tidak pernah di-commit; header `kid` memungkinkan rotasi seketika; masa berlaku AT pendek (15 menit); daftar pencabutan `jti` dan introspeksi tetap berlaku. Risiko ditutup oleh migrasi ke RS256 (F-011).
 
 ---
 
@@ -2468,6 +2485,9 @@ Menyesuaikan masa berlaku sesi dan refresh token berdasarkan skor risiko — kon
 
 **F-010: OpenID Connect Discovery**
 Mempublikasikan dokumen `.well-known/openid-configuration` yang lengkap untuk konfigurasi otomatis klien OIDC.
+
+**F-011: Migrasi Penandatanganan JWT dari HS256 ke RS256**
+Mengganti secret HS256 Fase 1 dengan RS256 yang kunci privatnya berada di Vault Transit Engine (didukung HSM), mempublikasikan JWKS (FR-TOKEN-007), dan memungkinkan layanan hilir memverifikasi token secara lokal. Cutover berbasis `kid` sesuai §16.3; menutup R-008.
 
 ---
 
