@@ -126,7 +126,7 @@ Domain Discovery was performed using Event Storming methodology, examining the a
 
 | Actor | Type | Interaction Pattern |
 |---|---|---|
-| Bank Administrator | Human | Web browser via Bank Administration Portal; logs in without a company code (internal bank realm) |
+| Bank Administrator | Human | Web browser via Bank Administration Portal (internal network/VPN only; no BFF in Phase 1); logs in without a company code (internal bank realm) |
 | Corporate User | Human | Web browser via Corporate Portal; logs in with company code + username |
 | Mobile Approver | Human | Native mobile application; logs in with company code + username |
 | API Client (Machine) | System | OAuth2 Client Credentials flow |
@@ -448,7 +448,7 @@ Accept a **Company Code**, **Username**, and password. The system resolves the (
 - Identifier resolution must happen **before** password verification, because lockout policy and MFA policy are evaluated per identity.
 
 **Actors without a corporate (Bank Administrator):**
-A Bank Administrator is not owned by any corporate, and logs in via a separate endpoint, `POST /api/v1/auth/admin/login` (§11.1), which has no `company_code` field at all — it is no longer the same field with an "omit or not" choice on one shared endpoint. This endpoint is reachable only by the Bank Administration Portal BFF (verified via mTLS/SPIFFE with an Istio `AuthorizationPolicy`, FRD FR-LOGIN-001a), so corporate users cannot reach the bank admin realm — not because they "leave `company_code` empty", but because they physically cannot reach this endpoint. Omitting `company_code` on `POST /api/v1/auth/login` (corporate) is still `ERR-REQUEST-003` (see §13.0).
+A Bank Administrator is not owned by any corporate, and logs in via a separate endpoint, `POST /api/v1/auth/admin/login` (§11.1), which has no `company_code` field at all — it is no longer the same field with an "omit or not" choice on one shared endpoint. This endpoint is routed only by the internal API Gateway, which is reachable only from the bank's internal network (VPN); the public API Gateway does not route `/api/v1/auth/admin/*`, and the Authentication Service only accepts this endpoint from the internal gateway's SPIFFE ID (Istio `AuthorizationPolicy`, FRD FR-LOGIN-001a). As a result, corporate users cannot reach the bank admin realm — not because they "leave `company_code` empty", but because they physically cannot reach this endpoint. Omitting `company_code` on `POST /api/v1/auth/login` (corporate) is still `ERR-REQUEST-003` (see §13.0).
 
 **Corporate enumeration prevention:**
 An unknown `company_code` must produce a response, status code, and timing profile identical to a wrong password (see FR-LOGIN-003). The system must not reveal whether a corporate is registered.
@@ -816,7 +816,7 @@ The Authentication Module **no longer follows a gRPC-first approach**. Transport
 | Bidirectional streaming (many ↔ many) | gRPC | Both sides send messages independently over a single stream. |
 
 **Decision rules:**
-1. A need consumed by a BFF (Corporate Portal, Bank Administration Portal), the mobile app, or traffic from the API Gateway that can be met with one request and one response **must** be exposed as REST.
+1. A need consumed by the Corporate Portal BFF, the Bank Administration Portal (directly from the browser via the internal API Gateway), the mobile app, or traffic from the API Gateway that can be met with one request and one response **must** be exposed as REST.
 2. A unary need consumed **only** by other backend services may be exposed as unary gRPC. If the same capability is also needed by a BFF, it is still exposed via REST for the BFF; both adapters call the same use case.
 3. gRPC streaming is used when a need inherently requires one of the three streaming patterns above, regardless of the consumer (as long as it is inside the mesh). Short-interval REST polling that loads the system is a signal that the need should move to server streaming.
 
@@ -855,7 +855,7 @@ The list below is **not a scope commitment** for this release; it only illustrat
 | Unary (service-to-service) | `GetSessionContext` | Backend domain services | Fetch session context (principal, AAL, authentication method) for authorization decisions in other services |
 | Server streaming | `WatchSessionRevocations` | BFF, API Gateway | Push session/token revocation notifications (force logout from Fraud Context, user revocation) in real time without polling |
 | Server streaming | `WatchMfaChallenge` | Corporate Portal BFF | Wait for the push-MFA approval result from the Mobile Approval app without long-polling |
-| Client streaming | `BulkRevokeSessions` | Bank Administration Portal (via BFF) | Upload a large list of sessions/users to revoke, answered with one result summary |
+| Client streaming | `BulkRevokeSessions` | Deferred — no consumer in Phase 1 | Upload a large list of sessions/users to revoke, answered with one result summary. A browser cannot open a gRPC client stream and the Bank Administration Portal has no BFF yet, so this RPC is implemented together with F-012 |
 | Bidirectional streaming | `ValidateTokens` | API Gateway | Long-lived, low-latency token validation/introspection channel, reducing per-request overhead |
 
 ### 10.5.4 gRPC Security and Error Handling
@@ -895,7 +895,7 @@ Login is split into **three distinct endpoints**, one per calling client, each w
 | Endpoint | Caller | Client identity established via |
 |---|---|---|
 | `POST /api/v1/auth/login` | Corporate Portal BFF (Go service, in-mesh) | Istio mTLS peer identity (SPIFFE ID), enforced by `AuthorizationPolicy`. Does not accept a `client_id` field. |
-| `POST /api/v1/auth/admin/login` | Bank Administration Portal BFF (Go service, in-mesh) | Istio mTLS peer identity (SPIFFE ID), enforced by `AuthorizationPolicy`. Does not accept a `client_id` field. Does not accept `company_code` — resolution is always in the internal bank realm. |
+| `POST /api/v1/auth/admin/login` | Bank Administration Portal SPA in the browser, directly with no BFF, through the internal API Gateway reachable only from the VPN | Network boundary: only the internal API Gateway routes this endpoint, and the Authentication Service only accepts it from the internal gateway's SPIFFE ID (`AuthorizationPolicy`). The calling app is **not** cryptographically verified. Does not accept a `client_id` field. Does not accept `company_code` — resolution is always in the internal bank realm. |
 | `POST /api/v1/auth/mobile/login` | Mobile Approval app (native, outside the mesh) | Self-declared `client_id` field — **unauthenticated**. See FRD BR-013 for the resulting constraint on its use. |
 
 ### POST /api/v1/auth/login
@@ -977,7 +977,11 @@ There is no `company_code` field — a Bank Administrator is not owned by any co
 
 **Note on MFA:** For a Bank Administrator identity, MFA is always mandatory (BR-003) — both because the identity itself is flagged as a Bank Administrator in the Identity Context, and because the request arrived via this endpoint. Both conditions are deliberately redundant (defense-in-depth, FRD BR-013), not relied on individually.
 
-**Caller verification (mesh):** Same mechanism as `/auth/login` — this endpoint only accepts requests from the Bank Administration Portal BFF (`spiffe://cluster.local/ns/bank-admin/sa/bff`), enforced by `AuthorizationPolicy`.
+**Caller verification (network, Phase 1 without a BFF):** The Bank Administration Portal is an SPA that calls this endpoint directly from the browser through the internal API Gateway (a separate Kong instance deployed only on the internal network, with an IP allowlist for the VPN ranges). The public API Gateway does not route `/api/v1/auth/admin/*`. On the mesh side, `AuthorizationPolicy` only allows the internal gateway's SPIFFE ID (e.g. `spiffe://cluster.local/ns/gateway-internal/sa/kong`) for this endpoint. The `aud` claim and Bank Administrator session policy are derived from this endpoint plus that internal gateway identity. The internal gateway plays the same role as the public API Gateway, including as the JWT verifier (§16.3).
+
+This proves the request came from the internal network, **not** that the calling app is the genuine Bank Administration Portal. Mandatory MFA above is therefore the primary control. If the portal must be reachable from outside the VPN, a BFF must be added first (F-012).
+
+**Token storage in the browser:** Without a BFF, the SPA holds the Access Token and Refresh Token. The Access Token is kept in memory only, never in `localStorage`/`sessionStorage`. How the Refresh Token is stored (response body as today, or an `HttpOnly; Secure; SameSite=Strict` cookie set by the internal gateway) is still an open decision.
 
 ### POST /api/v1/auth/mobile/login
 
@@ -1061,7 +1065,7 @@ Triggers delivery of the same OTP code via WhatsApp, as an alternative channel t
 
 ### POST /api/v1/auth/token/refresh
 
-**Request (from the Corporate Portal / Bank Administration Portal BFF):** `{ "refresh_token": "..." }` — client identity is taken from the same mTLS peer identity used at login, not a body field (FRD FR-TOKEN-005).
+**Request (from the Corporate Portal BFF, or the Bank Administration Portal SPA via the internal API Gateway):** `{ "refresh_token": "..." }` — client identity is taken from the same mTLS peer identity used at login (the BFF's SPIFFE ID, or the internal gateway's SPIFFE ID for the Bank Administration Portal), not a body field (FRD FR-TOKEN-005).
 **Request (from Mobile Approval):** `{ "refresh_token": "...", "client_id": "mobile-approval" }`
 **Response 200:** New access token + new refresh token, plus `"code": "00", "code_client": "00"`.
 **Response 200 (code: ERR-TOKEN-003, reuse detected):** All sessions revoked; error message indicates security anomaly; `code_client: "05"` (client must clear session and redirect to login).
@@ -2146,13 +2150,14 @@ sequenceDiagram
 
 | Grant Type | Used By | Note |
 |---|---|---|
-| Resource Owner Password Credentials (ROPC), client authenticated via mesh mTLS | Corporate Portal BFF (`/auth/login`), Bank Administration Portal BFF (`/auth/admin/login`) | Client receives raw password from its own end user, but the calling BFF's identity is verified by Istio `AuthorizationPolicy` (FR-LOGIN-001a) rather than a self-declared `client_id` — see BR-013. Phase 1. |
+| Resource Owner Password Credentials (ROPC), client authenticated via mesh mTLS | Corporate Portal BFF (`/auth/login`) | Client receives raw password from its own end user, but the calling BFF's identity is verified by Istio `AuthorizationPolicy` (FR-LOGIN-001a) rather than a self-declared `client_id` — see BR-013. Phase 1. |
+| Resource Owner Password Credentials (ROPC), network-restricted client | Bank Administration Portal SPA (`/auth/admin/login`, via internal API Gateway/VPN) | The browser sends the password directly; the calling app is not authenticated, only restricted to the internal network (VPN + internal gateway). Acceptable because MFA is always mandatory for Bank Administrators (BR-003). Phase 1, transitional — see F-012. |
 | Resource Owner Password Credentials (ROPC), unauthenticated client | Mobile Approval (`/auth/mobile/login`) | Client receives raw password; calling app identified only by a self-declared `client_id` (no client authentication yet). Phase 1, transitional — candidate for PKCE or app attestation. |
-| Authorization Code + PKCE | Mobile (candidate, Phase 2) | Removes the unauthenticated `client_id` gap on the one remaining public client; no longer needed for Corporate Portal / Bank Administration Portal now that their BFFs are mesh-authenticated. |
+| Authorization Code + PKCE | Mobile (candidate, Phase 2) | Removes the unauthenticated `client_id` gap on Mobile Approval; not needed for Corporate Portal since its BFF is mesh-authenticated. The Bank Administration Portal is handled by F-012, not PKCE. |
 | Client Credentials | Machine-to-machine API access | System-level clients; no user context |
 | Refresh Token | All clients | Token lifetime extension |
 
-**Trade-off:** the BFF-mediated ROPC rows are acceptable long-term — client authentication there is real (mTLS), not merely assumed. The unauthenticated-client ROPC row (Mobile Approval) remains a transitional trade-off, acceptable only because MFA-mandatory and session-policy decisions no longer depend on its self-declared `client_id` (BR-013); it should still be hardened (PKCE or app attestation) rather than left as-is indefinitely.
+**Trade-off:** the BFF-mediated ROPC rows are acceptable long-term — client authentication there is real (mTLS), not merely assumed. The unauthenticated-client ROPC row (Mobile Approval) remains a transitional trade-off, acceptable only because MFA-mandatory and session-policy decisions no longer depend on its self-declared `client_id` (BR-013); it should still be hardened (PKCE or app attestation) rather than left as-is indefinitely. The Bank Administration Portal ROPC row relies on a network boundary (VPN), not app identity; that is sufficient only while the portal is reachable solely from the internal network, and must be revisited (F-012) as soon as that changes.
 
 ## 16.2 OpenID Connect (OIDC)
 
@@ -2457,7 +2462,7 @@ The 300ms hash time is intentional: makes brute-force computationally expensive 
 ## Phase 2
 
 **F-001: Authorization Code + PKCE Flow (or app attestation) for Mobile Approval**
-Corporate Portal and Bank Administration Portal no longer need this migration as of §11.1/§16.1 — their BFFs authenticate to the Authentication Service via mesh mTLS (Istio `AuthorizationPolicy`), which already removes the unauthenticated-`client_id` gap ROPC had. `POST /api/v1/auth/mobile/login` (Mobile Approval) remains the one client where the calling app is not cryptographically verified; harden it via Authorization Code + PKCE or platform app attestation (Play Integrity / App Attest), eliminating reliance on a self-declared `client_id` there too.
+Corporate Portal no longer needs this migration as of §11.1/§16.1 — its BFF authenticates to the Authentication Service via mesh mTLS (Istio `AuthorizationPolicy`), which already removes the unauthenticated-`client_id` gap ROPC had. The Bank Administration Portal is handled by F-012. `POST /api/v1/auth/mobile/login` (Mobile Approval) is the one client where the calling app is not cryptographically verified **and** that is reachable from the internet; harden it via Authorization Code + PKCE or platform app attestation (Play Integrity / App Attest), eliminating reliance on a self-declared `client_id` there too.
 
 **F-002: Passkey / Passwordless Login**
 Full passkey support (FIDO2 discoverable credentials synchronized via platform keychain). Users log in with biometrics and no password.
@@ -2488,6 +2493,9 @@ Publish complete `.well-known/openid-configuration` document for auto-configurat
 
 **F-011: JWT Signing Migration from HS256 to RS256**
 Replace the Phase 1 HS256 secret with RS256 whose private key lives in the Vault Transit Engine (HSM-backed), publish JWKS (FR-TOKEN-007), and allow downstream services to verify tokens locally. `kid`-based cutover per §16.3; closes R-008.
+
+**F-012: BFF for the Bank Administration Portal**
+In Phase 1 the Bank Administration Portal runs without a BFF because it is reachable only from the internal network (VPN): its app identity is not verified and tokens are held by the browser (§11.1). A Bank Administration Portal BFF (in-mesh Go service, SPIFFE ID `spiffe://cluster.local/ns/bank-admin/sa/bff`) must be added when any of these happens: the portal needs to be reachable from outside the VPN, tokens may no longer be held by the browser, or `BulkRevokeSessions` (gRPC client streaming, §10.5.3) is needed. At that point `/auth/admin/login` goes back to accepting only that BFF's SPIFFE ID, the same as `/auth/login`.
 
 ---
 

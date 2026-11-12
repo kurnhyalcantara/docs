@@ -126,7 +126,7 @@ Domain Discovery dilakukan menggunakan metodologi Event Storming, dengan menelaa
 
 | Aktor | Tipe | Pola Interaksi |
 |---|---|---|
-| Bank Administrator | Manusia | Peramban web melalui Bank Administration Portal; login tanpa company code (realm internal bank) |
+| Bank Administrator | Manusia | Peramban web melalui Bank Administration Portal (hanya dari jaringan internal/VPN; tanpa BFF pada Fase 1); login tanpa company code (realm internal bank) |
 | Corporate User | Manusia | Peramban web melalui Corporate Portal; login dengan company code + username |
 | Mobile Approver | Manusia | Aplikasi mobile native; login dengan company code + username |
 | API Client (Mesin) | Sistem | Alur OAuth2 Client Credentials |
@@ -447,7 +447,7 @@ Menerima **Company Code**, **Username**, dan kata sandi. Sistem me-resolve pasan
 - Resolusi pengenal wajib terjadi **sebelum** verifikasi kata sandi, karena kebijakan lockout dan kebijakan MFA dievaluasi per identitas.
 
 **Aktor tanpa korporasi (Bank Administrator):**
-Bank Administrator tidak dimiliki oleh korporasi mana pun, dan login lewat endpoint terpisah, `POST /api/v1/auth/admin/login` (§11.1), yang memang tidak memiliki field `company_code` sama sekali — bukan lagi field yang sama dengan pilihan "dihilangkan atau tidak" pada satu endpoint bersama. Endpoint ini hanya bisa diakses oleh BFF Bank Administration Portal (diverifikasi mTLS/SPIFFE via Istio `AuthorizationPolicy`, FRD FR-LOGIN-001a), sehingga pengguna korporasi tidak dapat menjangkau realm bank admin — bukan karena mereka "mengosongkan `company_code`", tapi karena mereka secara fisik tidak bisa mencapai endpoint ini. Menghilangkan `company_code` pada `POST /api/v1/auth/login` (korporasi) tetap `ERR-REQUEST-003` (lihat §13.0).
+Bank Administrator tidak dimiliki oleh korporasi mana pun, dan login lewat endpoint terpisah, `POST /api/v1/auth/admin/login` (§11.1), yang memang tidak memiliki field `company_code` sama sekali — bukan lagi field yang sama dengan pilihan "dihilangkan atau tidak" pada satu endpoint bersama. Endpoint ini hanya dirutekan oleh API Gateway internal yang hanya dapat dijangkau dari jaringan internal bank (VPN); API Gateway publik tidak merutekan `/api/v1/auth/admin/*`, dan Auth Service hanya menerima endpoint ini dari SPIFFE ID gateway internal (Istio `AuthorizationPolicy`, FRD FR-LOGIN-001a). Dengan begitu pengguna korporasi tidak dapat menjangkau realm bank admin — bukan karena mereka "mengosongkan `company_code`", tapi karena mereka secara fisik tidak bisa mencapai endpoint ini. Menghilangkan `company_code` pada `POST /api/v1/auth/login` (korporasi) tetap `ERR-REQUEST-003` (lihat §13.0).
 
 **Pencegahan enumerasi korporasi:**
 `company_code` yang tidak dikenal harus menghasilkan respons, kode status, dan profil waktu yang identik dengan kata sandi salah (lihat FR-LOGIN-003). Sistem tidak boleh mengungkapkan apakah suatu korporasi terdaftar.
@@ -815,7 +815,7 @@ Modul Autentikasi **tidak lagi menganut pendekatan gRPC-first**. Pemilihan trans
 | Bidirectional streaming (banyak ↔ banyak) | gRPC | Kedua pihak mengirim pesan secara independen di atas satu stream. |
 
 **Aturan keputusan:**
-1. Kebutuhan yang dikonsumsi BFF (Corporate Portal, Bank Administration Portal), aplikasi mobile, atau lalu lintas dari API Gateway dan dapat dipenuhi dengan satu request dan satu response **wajib** diekspos sebagai REST.
+1. Kebutuhan yang dikonsumsi BFF Corporate Portal, Bank Administration Portal (langsung dari peramban via API Gateway internal), aplikasi mobile, atau lalu lintas dari API Gateway dan dapat dipenuhi dengan satu request dan satu response **wajib** diekspos sebagai REST.
 2. Kebutuhan unary yang **hanya** dikonsumsi service backend lain boleh diekspos sebagai gRPC unary. Bila kapabilitas yang sama juga dibutuhkan BFF, kapabilitas tersebut tetap diekspos via REST untuk BFF; kedua adapter memanggil use case yang sama.
 3. gRPC streaming dipakai bila kebutuhan secara inheren memerlukan salah satu dari tiga pola streaming di atas, siapa pun konsumennya (selama berada di dalam mesh). Polling REST berinterval pendek yang membebani sistem merupakan sinyal bahwa kebutuhan tersebut sebaiknya dipindah ke server streaming.
 
@@ -854,7 +854,7 @@ Daftar berikut **bukan komitmen scope** rilis ini; hanya contoh kebutuhan yang m
 | Unary (antar service) | `GetSessionContext` | Service domain backend | Mengambil konteks sesi (principal, AAL, metode autentikasi) untuk keputusan otorisasi di service lain |
 | Server streaming | `WatchSessionRevocations` | BFF, API Gateway | Mendorong notifikasi pencabutan sesi/token (logout paksa dari Fraud Context, pencabutan oleh pengguna) secara real-time tanpa polling |
 | Server streaming | `WatchMfaChallenge` | BFF Corporate Portal | Menunggu hasil persetujuan push MFA dari aplikasi Mobile Approval tanpa long-polling |
-| Client streaming | `BulkRevokeSessions` | Bank Administration Portal (via BFF) | Mengunggah daftar sesi/pengguna dalam jumlah besar untuk dicabut, dibalas satu ringkasan hasil |
+| Client streaming | `BulkRevokeSessions` | Ditunda — belum ada konsumen pada Fase 1 | Mengunggah daftar sesi/pengguna dalam jumlah besar untuk dicabut, dibalas satu ringkasan hasil. Peramban tidak dapat membuka gRPC client streaming dan Bank Administration Portal belum memakai BFF, sehingga RPC ini baru diimplementasikan bersama F-012 |
 | Bidirectional streaming | `ValidateTokens` | API Gateway | Kanal validasi/introspeksi token berlatensi rendah yang berumur panjang, mengurangi overhead per-request |
 
 ### 10.5.4 Keamanan dan Penanganan Galat gRPC
@@ -894,7 +894,7 @@ Login sekarang terbagi ke **tiga endpoint terpisah**, satu per client pemanggil,
 | Endpoint | Pemanggil | Identitas client dibuktikan via |
 |---|---|---|
 | `POST /api/v1/auth/login` | BFF Corporate Portal (service Go, satu mesh dengan Auth Service) | mTLS peer identity (SPIFFE ID) Istio, ditegakkan `AuthorizationPolicy`. Tidak menerima field `client_id`. |
-| `POST /api/v1/auth/admin/login` | BFF Bank Administration Portal (service Go, satu mesh) | mTLS peer identity (SPIFFE ID) Istio, ditegakkan `AuthorizationPolicy`. Tidak menerima field `client_id`. Tidak menerima `company_code` — resolusi selalu di realm internal bank. |
+| `POST /api/v1/auth/admin/login` | SPA Bank Administration Portal di peramban, langsung tanpa BFF, melalui API Gateway internal yang hanya dapat dijangkau dari VPN | Batas jaringan: hanya API Gateway internal yang merutekan endpoint ini, dan Auth Service hanya menerimanya dari SPIFFE ID gateway internal (`AuthorizationPolicy`). Aplikasi pemanggil **tidak** dibuktikan secara kriptografis. Tidak menerima field `client_id`. Tidak menerima `company_code` — resolusi selalu di realm internal bank. |
 | `POST /api/v1/auth/mobile/login` | Aplikasi Mobile Approval (native, di luar mesh) | Field `client_id` yang diklaim sendiri — **tidak terautentikasi**. Lihat FRD BR-013 untuk batasan penggunaannya. |
 
 ### POST /api/v1/auth/login
@@ -976,7 +976,11 @@ Tidak ada field `company_code` — Bank Administrator tidak dimiliki korporasi m
 
 **Catatan MFA:** Untuk identity Bank Administrator, MFA selalu wajib (BR-003) — baik karena identity itu sendiri berstatus Bank Administrator di Identity Context, maupun karena request masuk lewat endpoint ini. Keduanya sengaja redundan (defense-in-depth, FRD BR-013), bukan salah satunya dianggap cukup sendirian.
 
-**Verifikasi caller (mesh):** Sama seperti `/auth/login` — hanya menerima request dari BFF Bank Administration Portal (`spiffe://cluster.local/ns/bank-admin/sa/bff`), ditegakkan `AuthorizationPolicy`.
+**Verifikasi caller (jaringan, Fase 1 tanpa BFF):** Bank Administration Portal adalah SPA yang memanggil endpoint ini langsung dari peramban melalui API Gateway internal (instance Kong terpisah yang hanya terpasang di jaringan internal dan menerapkan allowlist IP rentang VPN). API Gateway publik tidak merutekan `/api/v1/auth/admin/*`. Di sisi mesh, `AuthorizationPolicy` hanya mengizinkan SPIFFE ID gateway internal (mis. `spiffe://cluster.local/ns/gateway-internal/sa/kong`) untuk endpoint ini. Klaim `aud` dan kebijakan sesi Bank Administrator ditentukan dari endpoint ini plus identitas gateway internal tersebut. Gateway internal memegang peran yang sama dengan API Gateway publik, termasuk sebagai verifier JWT (§16.3).
+
+Mekanisme ini membuktikan request berasal dari jaringan internal, **bukan** bahwa aplikasinya Bank Administration Portal yang sah. Karena itu MFA wajib di atas menjadi kontrol utama. Bila portal perlu diakses dari luar VPN, BFF wajib ditambahkan terlebih dahulu (F-012).
+
+**Penyimpanan token di peramban:** Tanpa BFF, Access Token dan Refresh Token dipegang SPA. Access Token hanya disimpan di memori, tidak di `localStorage`/`sessionStorage`. Cara penyimpanan Refresh Token (body response seperti sekarang, atau cookie `HttpOnly; Secure; SameSite=Strict` yang di-set gateway internal) masih keputusan terbuka.
 
 ### POST /api/v1/auth/mobile/login
 
@@ -1060,7 +1064,7 @@ Memicu pengiriman kode OTP yang sama via WhatsApp, sebagai alternatif kanal dari
 
 ### POST /api/v1/auth/token/refresh
 
-**Request (dari BFF Corporate Portal / Bank Administration Portal):** `{ "refresh_token": "..." }` — identitas client diambil dari mTLS peer identity yang sama seperti saat login, bukan field body (FRD FR-TOKEN-005).
+**Request (dari BFF Corporate Portal, atau SPA Bank Administration Portal via API Gateway internal):** `{ "refresh_token": "..." }` — identitas client diambil dari mTLS peer identity yang sama seperti saat login (SPIFFE ID BFF, atau SPIFFE ID gateway internal untuk Bank Administration Portal), bukan field body (FRD FR-TOKEN-005).
 **Request (dari Mobile Approval):** `{ "refresh_token": "...", "client_id": "mobile-approval" }`
 **Response 200:** Access token baru + refresh token baru, plus `"code": "00", "code_client": "00"`.
 **Response 200 (code: ERR-TOKEN-003, penggunaan ulang terdeteksi):** Seluruh sesi dicabut; pesan galat menunjukkan adanya anomali keamanan; `code_client: "05"` (klien wajib membersihkan sesi dan redirect ke login).
@@ -2146,13 +2150,14 @@ sequenceDiagram
 
 | Grant Type | Digunakan Oleh | Catatan |
 |---|---|---|
-| Resource Owner Password Credentials (ROPC), client diautentikasi via mTLS mesh | BFF Corporate Portal (`/auth/login`), BFF Bank Administration Portal (`/auth/admin/login`) | Client menerima kata sandi mentah dari user-nya sendiri, tapi identitas BFF pemanggil diverifikasi Istio `AuthorizationPolicy` (FR-LOGIN-001a), bukan dari field `client_id` yang diklaim sendiri — lihat BR-013. Fase 1. |
+| Resource Owner Password Credentials (ROPC), client diautentikasi via mTLS mesh | BFF Corporate Portal (`/auth/login`) | Client menerima kata sandi mentah dari user-nya sendiri, tapi identitas BFF pemanggil diverifikasi Istio `AuthorizationPolicy` (FR-LOGIN-001a), bukan dari field `client_id` yang diklaim sendiri — lihat BR-013. Fase 1. |
+| Resource Owner Password Credentials (ROPC), client dibatasi jaringan | SPA Bank Administration Portal (`/auth/admin/login`, via API Gateway internal/VPN) | Peramban mengirim kata sandi langsung; aplikasi pemanggil tidak diautentikasi, hanya dibatasi ke jaringan internal (VPN + gateway internal). Dapat diterima karena MFA selalu wajib untuk Bank Administrator (BR-003). Fase 1, transisional — lihat F-012. |
 | Resource Owner Password Credentials (ROPC), client tidak terautentikasi | Mobile Approval (`/auth/mobile/login`) | Client menerima kata sandi mentah; app pemanggil cuma diidentifikasi dari `client_id` yang diklaim sendiri (belum ada autentikasi client). Fase 1, transisional — kandidat PKCE atau app attestation. |
-| Authorization Code + PKCE | Mobile (kandidat, Fase 2) | Menutup celah `client_id` tak-terautentikasi pada satu-satunya public client yang tersisa; tidak lagi diperlukan untuk Corporate Portal / Bank Administration Portal karena BFF keduanya sudah terautentikasi lewat mesh. |
+| Authorization Code + PKCE | Mobile (kandidat, Fase 2) | Menutup celah `client_id` tak-terautentikasi pada Mobile Approval; tidak diperlukan untuk Corporate Portal karena BFF-nya sudah terautentikasi lewat mesh. Bank Administration Portal ditangani lewat F-012, bukan PKCE. |
 | Client Credentials | Akses API mesin-ke-mesin | Klien tingkat sistem; tanpa konteks pengguna |
 | Refresh Token | Semua klien | Perpanjangan masa berlaku token |
 
-**Trade-off:** baris ROPC yang dimediasi BFF sudah bisa diterima secara jangka panjang — autentikasi client di situ nyata (mTLS), bukan sekadar diasumsikan. Baris ROPC client-tak-terautentikasi (Mobile Approval) tetap trade-off transisional, dapat diterima hanya karena keputusan MFA-wajib dan kebijakan sesi tidak lagi bergantung pada `client_id` yang diklaim sendiri (BR-013); tetap perlu diperkuat (PKCE atau app attestation), bukan dibiarkan begitu saja.
+**Trade-off:** baris ROPC yang dimediasi BFF sudah bisa diterima secara jangka panjang — autentikasi client di situ nyata (mTLS), bukan sekadar diasumsikan. Baris ROPC client-tak-terautentikasi (Mobile Approval) tetap trade-off transisional, dapat diterima hanya karena keputusan MFA-wajib dan kebijakan sesi tidak lagi bergantung pada `client_id` yang diklaim sendiri (BR-013); tetap perlu diperkuat (PKCE atau app attestation), bukan dibiarkan begitu saja. Baris ROPC Bank Administration Portal mengandalkan batas jaringan (VPN), bukan identitas aplikasi; ini cukup selama portal hanya dapat diakses dari jaringan internal, dan wajib ditinjau ulang (F-012) begitu syarat itu berubah.
 
 ## 16.2 OpenID Connect (OIDC)
 
@@ -2457,7 +2462,7 @@ Waktu hash 300 ms bersifat disengaja: membuat brute force mahal secara komputasi
 ## Fase 2
 
 **F-001: Alur Authorization Code + PKCE (atau app attestation) untuk Mobile Approval**
-Corporate Portal dan Bank Administration Portal tidak lagi butuh migrasi ini sejak §11.1/§16.1 — BFF keduanya sudah autentikasi ke Auth Service lewat mTLS mesh (Istio `AuthorizationPolicy`), yang sudah menutup celah `client_id` tak-terautentikasi yang dimiliki ROPC. `POST /api/v1/auth/mobile/login` (Mobile Approval) tetap satu-satunya client yang identitas app-nya belum dibuktikan secara kriptografis; perkuat lewat Authorization Code + PKCE atau app attestation platform (Play Integrity / App Attest), agar tidak lagi bergantung pada `client_id` yang diklaim sendiri di jalur itu juga.
+Corporate Portal tidak lagi butuh migrasi ini sejak §11.1/§16.1 — BFF-nya sudah autentikasi ke Auth Service lewat mTLS mesh (Istio `AuthorizationPolicy`), yang sudah menutup celah `client_id` tak-terautentikasi yang dimiliki ROPC. Bank Administration Portal ditangani lewat F-012. `POST /api/v1/auth/mobile/login` (Mobile Approval) adalah satu-satunya client yang identitas app-nya belum dibuktikan secara kriptografis **dan** dapat dijangkau dari internet; perkuat lewat Authorization Code + PKCE atau app attestation platform (Play Integrity / App Attest), agar tidak lagi bergantung pada `client_id` yang diklaim sendiri di jalur itu juga.
 
 **F-002: Passkey / Login Tanpa Kata Sandi**
 Dukungan passkey penuh (kredensial FIDO2 yang dapat ditemukan dan disinkronkan melalui keychain platform). Pengguna login dengan biometrik tanpa kata sandi.
@@ -2488,6 +2493,9 @@ Mempublikasikan dokumen `.well-known/openid-configuration` yang lengkap untuk ko
 
 **F-011: Migrasi Penandatanganan JWT dari HS256 ke RS256**
 Mengganti secret HS256 Fase 1 dengan RS256 yang kunci privatnya berada di Vault Transit Engine (didukung HSM), mempublikasikan JWKS (FR-TOKEN-007), dan memungkinkan layanan hilir memverifikasi token secara lokal. Cutover berbasis `kid` sesuai §16.3; menutup R-008.
+
+**F-012: BFF untuk Bank Administration Portal**
+Pada Fase 1, Bank Administration Portal berjalan tanpa BFF karena hanya dapat diakses dari jaringan internal (VPN): identitas aplikasinya tidak dibuktikan dan token dipegang peramban (§11.1). BFF Bank Administration Portal (service Go di mesh, SPIFFE ID `spiffe://cluster.local/ns/bank-admin/sa/bff`) wajib ditambahkan bila salah satu terjadi: portal perlu diakses dari luar VPN, token tidak boleh lagi dipegang peramban, atau `BulkRevokeSessions` (gRPC client streaming, §10.5.3) dibutuhkan. Saat itu `/auth/admin/login` kembali hanya menerima SPIFFE ID BFF tersebut, sama seperti `/auth/login`.
 
 ---
 
