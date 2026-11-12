@@ -548,6 +548,7 @@ Setelah autentikasi berhasil, buat `AuthenticationSession` dengan session ID uni
 Baik idle timeout (default: 15 menit) maupun absolute timeout (default: 8 jam) ditegakkan secara independen. Kedaluwarsa dievaluasi secara lazy (saat refresh token) dan eager (background sweeper).
 
 - **Lazy:** sebelum menerbitkan token baru, refresh menolak sesi yang `last_activity_at + idle_timeout_secs` atau `absolute_expires_at`-nya sudah lewat, lalu menandai sesi `EXPIRED`.
+  - **Ambang sisa minimum:** refresh juga ditolak bila sisa waktu menuju `absolute_expires_at` kurang dari ambang minimum (default: 30 detik, dapat dikonfigurasi). Sesi langsung ditandai `EXPIRED` dengan alasan `SESSION_EXPIRED_ABSOLUTE`, alih-alih menerbitkan Access Token yang hampir seketika kedaluwarsa (lihat FR-TOKEN-001).
 - **Eager:** sweeper berkala menandai `EXPIRED` setiap sesi `ACTIVE` yang sudah melewati salah satu batas, termasuk sesi yang client-nya tidak pernah kembali.
 - **Pencabutan Access Token saat kedaluwarsa:** setiap kali sesi ditandai `EXPIRED` (lazy maupun eager), `jti` Access Token terakhir sesi tersebut (`current_at_jti`) ditambahkan ke daftar pencabutan Redis dengan TTL = sisa masa berlakunya (sama seperti FR-TOKEN-005). Dengan begitu Access Token tidak tetap berlaku hingga 15 menit setelah sesinya berakhir.
 - Setiap kedaluwarsa menerbitkan `SessionRevoked` dengan alasan `SESSION_EXPIRED_IDLE` atau `SESSION_EXPIRED_ABSOLUTE` (§13.5).
@@ -629,6 +630,8 @@ Administrator dapat memaksa reset kata sandi untuk identitas mana pun. Pengguna 
 
 **FR-TOKEN-001: Struktur Access Token**
 JWT (RFC 7519); algoritma penandatanganan per fase mengikuti FR-TOKEN-002. Klaim: `iss`, `sub` (identity_id), `aud`, `iat`, `exp` (default 15 menit, dan tidak pernah melewati `absolute_expires_at` sesi: `exp = min(iat + 15 menit, absolute_expires_at)`), `jti`, `session_id`, `aal`, `device_id`, `scope`, `corporate_id`.
+
+`expires_in` pada response dihitung dari `exp - iat` (detik), bukan konstanta 900, agar jadwal refresh proaktif client (FR-SESSION-005) mengikuti masa berlaku yang sebenarnya. Bila `absolute_expires_at - iat` di bawah ambang sisa minimum (FR-SESSION-002), token tidak diterbitkan.
 
 **FR-TOKEN-002: Penandatanganan Access Token**
 Bertahap (lihat §16.3):

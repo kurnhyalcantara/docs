@@ -549,6 +549,7 @@ On successful authentication, create `AuthenticationSession` with unique session
 Both idle timeout (default: 15 min) and absolute timeout (default: 8 hours) are independently enforced. Expiry is evaluated lazily (at token refresh) and eagerly (background sweeper).
 
 - **Lazy:** before issuing new tokens, refresh rejects a session whose `last_activity_at + idle_timeout_secs` or `absolute_expires_at` has passed, and marks it `EXPIRED`.
+  - **Minimum remaining threshold:** refresh is also rejected when the time left until `absolute_expires_at` is below a minimum threshold (default: 30 seconds, configurable). The session is marked `EXPIRED` immediately with reason `SESSION_EXPIRED_ABSOLUTE`, instead of issuing an Access Token that expires almost at once (see FR-TOKEN-001).
 - **Eager:** a periodic sweeper marks `EXPIRED` every `ACTIVE` session past either limit, including sessions whose client never comes back.
 - **Access Token revocation on expiry:** whenever a session is marked `EXPIRED` (lazy or eager), the `jti` of its latest Access Token (`current_at_jti`) is added to the Redis revocation list with TTL = its remaining lifetime (same as FR-TOKEN-005). This prevents the Access Token from remaining valid for up to 15 minutes after its session has ended.
 - Every expiry publishes `SessionRevoked` with reason `SESSION_EXPIRED_IDLE` or `SESSION_EXPIRED_ABSOLUTE` (§13.5).
@@ -630,6 +631,8 @@ Administrator can force password reset for any identity. User must set new passw
 
 **FR-TOKEN-001: Access Token Structure**
 JWT (RFC 7519); the signing algorithm per phase follows FR-TOKEN-002. Claims: `iss`, `sub` (identity_id), `aud`, `iat`, `exp` (15 min default, and never beyond the session's `absolute_expires_at`: `exp = min(iat + 15 min, absolute_expires_at)`), `jti`, `session_id`, `aal`, `device_id`, `scope`, `corporate_id`.
+
+`expires_in` in the response is computed as `exp - iat` (seconds), not a constant 900, so the client's proactive refresh schedule (FR-SESSION-005) follows the real lifetime. If `absolute_expires_at - iat` is below the minimum remaining threshold (FR-SESSION-002), no token is issued.
 
 **FR-TOKEN-002: Access Token Signing**
 Phased (see §16.3):
