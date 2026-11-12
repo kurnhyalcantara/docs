@@ -480,7 +480,7 @@ Saat kunci dibuka (otomatis setelah `locked_until` terlewati, atau oleh administ
 **FR-LOGIN-005: Audit Login**
 Setiap percobaan login (berhasil maupun gagal) harus dipersistensi sebagai catatan `LoginAttempt` yang berisi: identity_id, company_code_used, username_used, timestamp, outcome, failure_reason, ip_address, user_agent, device_fingerprint, session_id (bila berhasil).
 
-`company_code_used` dan `username_used` dicatat **sebagaimana dikirimkan** (setelah normalisasi), termasuk ketika resolusi gagal dan `identity_id` bernilai NULL. Tanpa keduanya, percobaan terhadap korporasi yang tidak ada tidak dapat diinvestigasi.
+`company_code_used` dan `username_used` dicatat **dari input request** (setelah normalisasi), bukan dari data identitas hasil resolusi, sehingga tetap terisi meskipun resolusi gagal dan `identity_id` bernilai NULL. Tanpa keduanya, percobaan terhadap korporasi yang tidak ada tidak dapat diinvestigasi.
 
 **FR-LOGIN-006: Kebijakan Sesi Simultan**
 Kebijakan yang dapat dikonfigurasi: Izinkan semua sesi bersamaan; Batasi N (yang terlama dibatalkan); Sesi tunggal (sesi sebelumnya dicabut saat login baru).

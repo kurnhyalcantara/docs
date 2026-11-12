@@ -481,7 +481,7 @@ On unlock (automatically after `locked_until` has passed, or by an administrator
 **FR-LOGIN-005: Login Audit**
 Every login attempt (success and failure) must be persisted as a `LoginAttempt` record containing: identity_id, company_code_used, username_used, timestamp, outcome, failure_reason, ip_address, user_agent, device_fingerprint, session_id (if successful).
 
-`company_code_used` and `username_used` are recorded **as submitted** (after normalization), including when resolution fails and `identity_id` is NULL. Without them, attempts against non-existent corporates cannot be investigated.
+`company_code_used` and `username_used` are recorded **from the request input** (after normalization), not from the resolved identity data, so they are still populated when resolution fails and `identity_id` is NULL. Without them, attempts against non-existent corporates cannot be investigated.
 
 **FR-LOGIN-006: Simultaneous Session Policy**
 Configurable policies: Allow all concurrent sessions; Limit N (oldest invalidated); Single session (prior revoked on new login).
