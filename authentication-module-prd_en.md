@@ -548,6 +548,11 @@ On successful authentication, create `AuthenticationSession` with unique session
 **FR-SESSION-002: Session Expiration**
 Both idle timeout (default: 15 min) and absolute timeout (default: 8 hours) are independently enforced. Expiry is evaluated lazily (at token refresh) and eagerly (background sweeper).
 
+- **Lazy:** before issuing new tokens, refresh rejects a session whose `last_activity_at + idle_timeout_secs` or `absolute_expires_at` has passed, and marks it `EXPIRED`.
+- **Eager:** a periodic sweeper marks `EXPIRED` every `ACTIVE` session past either limit, including sessions whose client never comes back.
+- **Access Token revocation on expiry:** whenever a session is marked `EXPIRED` (lazy or eager), the `jti` of its latest Access Token (`current_at_jti`) is added to the Redis revocation list with TTL = its remaining lifetime (same as FR-TOKEN-005). This prevents the Access Token from remaining valid for up to 15 minutes after its session has ended.
+- Every expiry publishes `SessionRevoked` with reason `SESSION_EXPIRED_IDLE` or `SESSION_EXPIRED_ABSOLUTE` (§13.5).
+
 **FR-SESSION-003: Session Revocation**
 Immediately revokable via: user-initiated logout, admin force logout, security event. Revocation immediately invalidates all associated Refresh Tokens.
 
@@ -556,6 +561,12 @@ Authenticated user can list their own active sessions. Administrator can list an
 
 **FR-SESSION-005: Session Activity Update**
 On every successful access token refresh, update `last_activity_at` to reset the idle timeout clock.
+
+API calls with an Access Token are verified at the API Gateway and do **not** update `last_activity_at`; refresh is the only activity signal. Because the idle timeout (15 min) equals the Access Token lifetime (15 min), clients must perform **proactive refresh**:
+
+- The client refreshes before the Access Token expires, at ~80% of its lifetime (default: minute 12), rather than waiting for expiry or an `ERR-TOKEN-004` response.
+- Proactive refresh happens only if there has been user activity (UI input/navigation) since the last refresh. With no activity, the client does not refresh, so the session ends by idle timeout as intended; background timers or polling must not count as activity.
+- This applies to the Corporate Portal BFF, the Bank Administration Portal SPA, and Mobile Approval.
 
 ## 8.4 Device Management
 
@@ -612,12 +623,13 @@ Default: 90 days (bank admin), 180 days (corporate users). Warnings at 14, 7, 3,
 Administrator can force password reset for any identity. User must set new password on next login.
 - Sets `force_password_change = TRUE`; the current password can still be used to log in (US-007)
 - Emits `AdminInitiatedPasswordReset` (once; repeating the action while the flag is already set emits no new event)
-- The subsequent password change emits `PasswordChanged` with `change_type = FORCED`
+- Stores the triggering admin identity in `force_password_change_by`
+- The subsequent password change emits `PasswordChanged` with `change_type = FORCED`, `force_reason = ADMIN_RESET`, and `forced_by` = the triggering admin; `force_password_change` and `force_password_change_by` are then cleared
 
 ## 8.6 Token Management
 
 **FR-TOKEN-001: Access Token Structure**
-JWT (RFC 7519); the signing algorithm per phase follows FR-TOKEN-002. Claims: `iss`, `sub` (identity_id), `aud`, `iat`, `exp` (15 min default), `jti`, `session_id`, `aal`, `device_id`, `scope`, `corporate_id`.
+JWT (RFC 7519); the signing algorithm per phase follows FR-TOKEN-002. Claims: `iss`, `sub` (identity_id), `aud`, `iat`, `exp` (15 min default, and never beyond the session's `absolute_expires_at`: `exp = min(iat + 15 min, absolute_expires_at)`), `jti`, `session_id`, `aal`, `device_id`, `scope`, `corporate_id`.
 
 **FR-TOKEN-002: Access Token Signing**
 Phased (see §16.3):
@@ -1192,6 +1204,7 @@ CREATE TABLE credentials (
     password_created_at   TIMESTAMPTZ NOT NULL,
     password_expires_at   TIMESTAMPTZ,
     force_password_change BOOLEAN NOT NULL DEFAULT FALSE,
+    force_password_change_by UUID,           -- admin identity that triggered FR-PWD-007; NULL when the flag is not set
     failed_attempt_count  INT NOT NULL DEFAULT 0,
     last_failed_at        TIMESTAMPTZ,
     lockout_status        VARCHAR(32) NOT NULL DEFAULT 'UNLOCKED',
@@ -1297,6 +1310,8 @@ CREATE TABLE authentication_sessions (
     last_activity_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     idle_timeout_secs   INT NOT NULL DEFAULT 900,
     absolute_expires_at TIMESTAMPTZ NOT NULL,
+    current_at_jti      VARCHAR(64),          -- jti of the latest Access Token issued for this session; updated on login & refresh
+    current_at_expires_at TIMESTAMPTZ,        -- exp of that Access Token; sets the revocation-list entry TTL
     revoked_at          TIMESTAMPTZ,
     revoke_reason       VARCHAR(64),
     creation_ip         INET NOT NULL,
@@ -1305,6 +1320,7 @@ CREATE TABLE authentication_sessions (
 CREATE INDEX idx_sessions_identity_status ON authentication_sessions(identity_id, status) WHERE status = 'ACTIVE';
 CREATE INDEX idx_sessions_device ON authentication_sessions(device_id) WHERE device_id IS NOT NULL;
 CREATE INDEX idx_sessions_expires ON authentication_sessions(absolute_expires_at) WHERE status = 'ACTIVE';
+CREATE INDEX idx_sessions_idle ON authentication_sessions(last_activity_at) WHERE status = 'ACTIVE';
 ```
 
 ### refresh_token_families
@@ -1571,13 +1587,22 @@ Revoke reasons: `USER_LOGOUT`, `ADMIN_FORCE_LOGOUT`, `PASSWORD_CHANGED`, `PASSWO
 {
   "identity_id": "identity_01H9XZ...",
   "changed_by": "identity_01H9XZ...",
-  "change_type": "USER_INITIATED",
+  "change_type": "FORCED",
+  "force_reason": "ADMIN_RESET",
+  "forced_by": "identity_admin01...",
   "sessions_revoked_count": 3,
   "occurred_at": "2026-06-30T10:00:00Z"
 }
 ```
 
 Change types: `USER_INITIATED` (voluntary change), `FORCED` (when `force_password_change` is set because of `AdminInitiatedPasswordReset`, or the password has expired).
+
+| Field | Present when | Value |
+|---|---|---|
+| `force_reason` | `change_type = FORCED` | `ADMIN_RESET` (`force_password_change` flag set, FR-PWD-007) or `PASSWORD_EXPIRED` (`password_expires_at` has passed). If both apply at once, `ADMIN_RESET` is used. |
+| `forced_by` | `force_reason = ADMIN_RESET` | The triggering admin identity, taken from `force_password_change_by`; equals `initiated_by` on `AdminInitiatedPasswordReset` (§13.16) |
+
+For `USER_INITIATED`, both fields are omitted. `changed_by` remains the identity that actually set the new password.
 
 ## 13.7 PasswordResetRequested
 

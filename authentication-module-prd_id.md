@@ -547,6 +547,11 @@ Setelah autentikasi berhasil, buat `AuthenticationSession` dengan session ID uni
 **FR-SESSION-002: Kedaluwarsa Sesi**
 Baik idle timeout (default: 15 menit) maupun absolute timeout (default: 8 jam) ditegakkan secara independen. Kedaluwarsa dievaluasi secara lazy (saat refresh token) dan eager (background sweeper).
 
+- **Lazy:** sebelum menerbitkan token baru, refresh menolak sesi yang `last_activity_at + idle_timeout_secs` atau `absolute_expires_at`-nya sudah lewat, lalu menandai sesi `EXPIRED`.
+- **Eager:** sweeper berkala menandai `EXPIRED` setiap sesi `ACTIVE` yang sudah melewati salah satu batas, termasuk sesi yang client-nya tidak pernah kembali.
+- **Pencabutan Access Token saat kedaluwarsa:** setiap kali sesi ditandai `EXPIRED` (lazy maupun eager), `jti` Access Token terakhir sesi tersebut (`current_at_jti`) ditambahkan ke daftar pencabutan Redis dengan TTL = sisa masa berlakunya (sama seperti FR-TOKEN-005). Dengan begitu Access Token tidak tetap berlaku hingga 15 menit setelah sesinya berakhir.
+- Setiap kedaluwarsa menerbitkan `SessionRevoked` dengan alasan `SESSION_EXPIRED_IDLE` atau `SESSION_EXPIRED_ABSOLUTE` (§13.5).
+
 **FR-SESSION-003: Pencabutan Sesi**
 Dapat dicabut seketika melalui: logout yang diprakarsai pengguna, force logout oleh admin, atau peristiwa keamanan. Pencabutan langsung membatalkan seluruh Refresh Token terkait.
 
@@ -555,6 +560,12 @@ Pengguna terautentikasi dapat melihat daftar sesi aktif miliknya. Administrator 
 
 **FR-SESSION-005: Pembaruan Aktivitas Sesi**
 Pada setiap keberhasilan refresh access token, perbarui `last_activity_at` untuk mereset penghitung idle timeout.
+
+Pemanggilan API dengan Access Token diverifikasi di API Gateway dan **tidak** memperbarui `last_activity_at`; satu-satunya sinyal aktivitas adalah refresh. Karena idle timeout (15 menit) sama dengan masa berlaku Access Token (15 menit), client wajib melakukan **refresh proaktif**:
+
+- Client me-refresh sebelum Access Token kedaluwarsa, pada ±80% masa berlakunya (default: menit ke-12), bukan menunggu Access Token kedaluwarsa atau respons `ERR-TOKEN-004`.
+- Refresh proaktif hanya dilakukan bila ada aktivitas pengguna (input/navigasi UI) sejak refresh terakhir. Bila tidak ada aktivitas, client tidak me-refresh sehingga sesi berakhir oleh idle timeout sebagaimana mestinya; timer atau polling di latar belakang tidak boleh dihitung sebagai aktivitas.
+- Ketentuan ini berlaku untuk SPA Corporate Portal, SPA Bank Administration Portal, dan Mobile Approval.
 
 ## 8.4 Manajemen Perangkat
 
@@ -611,12 +622,13 @@ Default: 90 hari (bank admin), 180 hari (pengguna korporasi). Peringatan pada 14
 Administrator dapat memaksa reset kata sandi untuk identitas mana pun. Pengguna harus menetapkan kata sandi baru pada login berikutnya.
 - Menetapkan `force_password_change = TRUE`; kata sandi saat ini tetap dapat dipakai untuk login (US-007)
 - Memancarkan `AdminInitiatedPasswordReset` (sekali; tindakan berulang saat flag sudah aktif tidak memancarkan event baru)
-- Perubahan kata sandi berikutnya memancarkan `PasswordChanged` dengan `change_type = FORCED`
+- Menyimpan identity admin pemicu di `force_password_change_by`
+- Perubahan kata sandi berikutnya memancarkan `PasswordChanged` dengan `change_type = FORCED`, `force_reason = ADMIN_RESET`, dan `forced_by` = admin pemicu; setelah itu `force_password_change` dan `force_password_change_by` dikosongkan
 
 ## 8.6 Manajemen Token
 
 **FR-TOKEN-001: Struktur Access Token**
-JWT (RFC 7519); algoritma penandatanganan per fase mengikuti FR-TOKEN-002. Klaim: `iss`, `sub` (identity_id), `aud`, `iat`, `exp` (default 15 menit), `jti`, `session_id`, `aal`, `device_id`, `scope`, `corporate_id`.
+JWT (RFC 7519); algoritma penandatanganan per fase mengikuti FR-TOKEN-002. Klaim: `iss`, `sub` (identity_id), `aud`, `iat`, `exp` (default 15 menit, dan tidak pernah melewati `absolute_expires_at` sesi: `exp = min(iat + 15 menit, absolute_expires_at)`), `jti`, `session_id`, `aal`, `device_id`, `scope`, `corporate_id`.
 
 **FR-TOKEN-002: Penandatanganan Access Token**
 Bertahap (lihat §16.3):
@@ -1191,6 +1203,7 @@ CREATE TABLE credentials (
     password_created_at   TIMESTAMPTZ NOT NULL,
     password_expires_at   TIMESTAMPTZ,
     force_password_change BOOLEAN NOT NULL DEFAULT FALSE,
+    force_password_change_by UUID,           -- identity admin yang memicu FR-PWD-007; NULL bila flag tidak aktif
     failed_attempt_count  INT NOT NULL DEFAULT 0,
     last_failed_at        TIMESTAMPTZ,
     lockout_status        VARCHAR(32) NOT NULL DEFAULT 'UNLOCKED',
@@ -1296,6 +1309,8 @@ CREATE TABLE authentication_sessions (
     last_activity_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     idle_timeout_secs   INT NOT NULL DEFAULT 900,
     absolute_expires_at TIMESTAMPTZ NOT NULL,
+    current_at_jti      VARCHAR(64),          -- jti Access Token terakhir yang diterbitkan untuk sesi ini; diperbarui saat login & refresh
+    current_at_expires_at TIMESTAMPTZ,        -- exp Access Token tersebut; menentukan TTL entri daftar pencabutan
     revoked_at          TIMESTAMPTZ,
     revoke_reason       VARCHAR(64),
     creation_ip         INET NOT NULL,
@@ -1304,6 +1319,7 @@ CREATE TABLE authentication_sessions (
 CREATE INDEX idx_sessions_identity_status ON authentication_sessions(identity_id, status) WHERE status = 'ACTIVE';
 CREATE INDEX idx_sessions_device ON authentication_sessions(device_id) WHERE device_id IS NOT NULL;
 CREATE INDEX idx_sessions_expires ON authentication_sessions(absolute_expires_at) WHERE status = 'ACTIVE';
+CREATE INDEX idx_sessions_idle ON authentication_sessions(last_activity_at) WHERE status = 'ACTIVE';
 ```
 
 ### refresh_token_families
@@ -1571,13 +1587,22 @@ Alasan pencabutan: `USER_LOGOUT`, `ADMIN_FORCE_LOGOUT`, `PASSWORD_CHANGED`, `PAS
 {
   "identity_id": "identity_01H9XZ...",
   "changed_by": "identity_01H9XZ...",
-  "change_type": "USER_INITIATED",
+  "change_type": "FORCED",
+  "force_reason": "ADMIN_RESET",
+  "forced_by": "identity_admin01...",
   "sessions_revoked_count": 3,
   "occurred_at": "2026-06-30T10:00:00Z"
 }
 ```
 
 Tipe perubahan: `USER_INITIATED` (perubahan sukarela), `FORCED` (saat `force_password_change` aktif akibat `AdminInitiatedPasswordReset`, atau kata sandi telah kedaluwarsa).
+
+| Field | Diisi bila | Nilai |
+|---|---|---|
+| `force_reason` | `change_type = FORCED` | `ADMIN_RESET` (flag `force_password_change` aktif, FR-PWD-007) atau `PASSWORD_EXPIRED` (`password_expires_at` terlewati). Bila keduanya berlaku bersamaan, dipakai `ADMIN_RESET`. |
+| `forced_by` | `force_reason = ADMIN_RESET` | Identity admin pemicu, diambil dari `force_password_change_by`; sama dengan `initiated_by` pada `AdminInitiatedPasswordReset` (§13.16) |
+
+Untuk `USER_INITIATED`, kedua field dihilangkan. `changed_by` tetap berisi identity yang benar-benar menetapkan kata sandi baru.
 
 ## 13.7 PasswordResetRequested
 
