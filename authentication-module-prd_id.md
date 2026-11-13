@@ -545,7 +545,14 @@ Kebijakan tingkat korporasi dapat mewajibkan MFA. Jika wajib dan pengguna belum 
 Setelah autentikasi berhasil, buat `AuthenticationSession` dengan session ID unik, referensi identitas, referensi perangkat, AAL, timestamp, idle timeout, absolute expiry, dan status `ACTIVE`.
 
 **FR-SESSION-002: Kedaluwarsa Sesi**
-Baik idle timeout (default: 15 menit) maupun absolute timeout (default: 8 jam) ditegakkan secara independen. Kedaluwarsa dievaluasi secara lazy (saat refresh token) dan eager (background sweeper).
+Baik idle timeout maupun absolute timeout ditegakkan secara independen. Nilainya ditentukan per client saat sesi dibuat, berdasarkan endpoint login yang dipanggil, dan disimpan di `idle_timeout_secs` serta `absolute_expires_at`:
+
+| Client | Idle timeout | Absolute timeout |
+|---|---|---|
+| Corporate Portal, Bank Administration Portal (web) | 15 menit | 8 jam |
+| Mobile Approval (`/auth/mobile/login`) | 24 jam | 7 hari |
+
+Sesi Mobile Approval yang panjang hanya aman karena aplikasi dikunci dengan PIN/biometrik (FR-SESSION-006). Kedaluwarsa dievaluasi secara lazy (saat refresh token) dan eager (background sweeper).
 
 - **Lazy:** sebelum menerbitkan token baru, refresh menolak sesi yang `last_activity_at + idle_timeout_secs` atau `absolute_expires_at`-nya sudah lewat, lalu menandai sesi `EXPIRED`.
   - **Ambang sisa minimum:** refresh juga ditolak bila sisa waktu menuju `absolute_expires_at` kurang dari ambang minimum (default: 30 detik, dapat dikonfigurasi). Sesi langsung ditandai `EXPIRED` dengan alasan `SESSION_EXPIRED_ABSOLUTE`, alih-alih menerbitkan Access Token yang hampir seketika kedaluwarsa (lihat FR-TOKEN-001).
@@ -566,7 +573,21 @@ Pemanggilan API dengan Access Token diverifikasi di API Gateway dan **tidak** me
 
 - Client me-refresh sebelum Access Token kedaluwarsa, pada ±80% masa berlakunya (default: menit ke-12), bukan menunggu Access Token kedaluwarsa atau respons `ERR-TOKEN-004`.
 - Refresh proaktif hanya dilakukan bila ada aktivitas pengguna (input/navigasi UI) sejak refresh terakhir. Bila tidak ada aktivitas, client tidak me-refresh sehingga sesi berakhir oleh idle timeout sebagaimana mestinya; timer atau polling di latar belakang tidak boleh dihitung sebagai aktivitas.
-- Ketentuan ini berlaku untuk SPA Corporate Portal, SPA Bank Administration Portal, dan Mobile Approval.
+- Ketentuan ini berlaku untuk SPA Corporate Portal dan SPA Bank Administration Portal. Pada Mobile Approval, refresh dilakukan setiap kali app lock dibuka (FR-SESSION-006) dan secara proaktif selama aplikasi berada di foreground. Dengan idle timeout 24 jam, approver cukup membuka aplikasi sekali sehari agar sesinya tetap hidup.
+
+**FR-SESSION-006: App Lock Mobile Approval (PIN & Biometrik)**
+App lock menggantikan login ulang yang sering pada Mobile Approval; app lock **tidak** menggantikan MFA, yang tetap wajib pada setiap login penuh.
+
+- **Onboarding wajib:** setelah login penuh pertama (kata sandi + MFA) di sebuah perangkat, aplikasi menampilkan onboarding app lock sebelum layar utama:
+  1. Membuat PIN aplikasi 6 digit (wajib). PIN berupa urutan atau pengulangan (mis. `123456`, `111111`) ditolak.
+  2. Mengaktifkan biometrik (Face ID / sidik jari): ditawarkan, opsional, dan dapat diaktifkan belakangan dari pengaturan. PIN tetap menjadi cadangan bila biometrik gagal.
+  Bila onboarding dibatalkan, aplikasi tidak menyimpan Refresh Token sehingga pengguna harus login penuh lagi saat membuka aplikasi berikutnya.
+- **Penyimpanan Refresh Token:** di secure storage platform (iOS Keychain / Android Keystore, berbasis hardware bila tersedia) dengan kontrol akses yang mewajibkan app lock dibuka sebelum token dapat dibaca. Refresh Token tidak pernah disimpan sebagai teks biasa.
+- **Kapan app lock diminta:** saat aplikasi dibuka (cold start) dan saat kembali dari background setelah ≥ 5 menit (dapat dikonfigurasi).
+- **PIN salah:** setelah 5 kali salah berturut-turut, aplikasi menghapus Refresh Token dan data sesi lokal; pengguna harus login penuh dan mengulang onboarding. Sesi di server berakhir oleh idle timeout, atau dapat dicabut pengguna dari daftar sesi (FR-SESSION-004).
+- **Perubahan biometrik:** bila data biometrik perangkat berubah (mis. sidik jari baru ditambahkan), platform membatalkan kunci biometrik; pengguna membuka dengan PIN lalu mengaktifkan ulang biometrik.
+- **Lupa PIN:** login penuh (kata sandi + MFA) lalu membuat PIN baru; data sesi lokal lama dihapus.
+- **Batasan Fase 1:** PIN dan biometrik diverifikasi secara lokal di perangkat; server tidak dapat membuktikan bahwa app lock benar-benar aktif. Penguatannya (device-bound key yang hanya bisa dipakai setelah app lock dibuka dan menandatangani setiap refresh, atau app attestation) masuk F-001.
 
 ## 8.4 Manajemen Perangkat
 
@@ -639,7 +660,7 @@ Bertahap (lihat §16.3):
 - **Fase 2 — RS256** (RSA minimum 2048-bit; RSA 4096-bit lebih disukai). Kunci publik di `/.well-known/jwks.json`. Rotasi kunci setiap 90 hari. Kunci privat berada di HSM/Vault (F-011).
 
 **FR-TOKEN-003: Refresh Token**
-Opak, acak kriptografis (minimum 32 byte). Hanya hash SHA-256 yang disimpan di sisi server. Masa berlaku: 24 jam (web), 7 hari (mobile). Terikat pada sesi.
+Opak, acak kriptografis (minimum 32 byte). Hanya hash SHA-256 yang disimpan di sisi server. Terikat pada sesi: `expires_at` Refresh Token mengikuti `absolute_expires_at` sesinya (8 jam untuk web, 7 hari untuk Mobile Approval; FR-SESSION-002) dan tidak pernah melewatinya. Refresh Token ikut batal saat sesinya berakhir karena alasan apa pun. Penyimpanan di Mobile Approval mengikuti FR-SESSION-006.
 
 **FR-TOKEN-004: Rotasi Refresh Token**
 Saat penukaran: validasi token, validasi sesi, tandai token lama sebagai `USED`, bangkitkan token baru, terbitkan Access Token baru.
@@ -740,6 +761,17 @@ Mempublikasikan kunci publik penandatanganan di `/.well-known/jwks.json` (RFC 75
 - Setiap sesi individual dapat dicabut
 - Pencabutan langsung membatalkan token terkait
 - Sesi saat ini teridentifikasi dengan jelas
+
+## US-010: Onboarding App Lock Mobile Approval
+**Sebagai** Mobile Approver, **saya ingin** membuka aplikasi dengan biometrik atau PIN, **agar** saya tidak perlu login dengan kata sandi dan MFA setiap kali akan menyetujui transaksi.
+
+**Kriteria Penerimaan:**
+- Setelah login pertama di perangkat, onboarding app lock tampil sebelum layar utama dan tidak dapat dilewati
+- Pembuatan PIN 6 digit wajib; PIN berupa urutan atau pengulangan ditolak
+- Aktivasi biometrik ditawarkan dan dapat dilewati; dapat diaktifkan belakangan dari pengaturan
+- Bila onboarding dibatalkan, sesi tidak disimpan dan pengguna harus login penuh saat membuka aplikasi berikutnya
+- Setelah onboarding, membuka aplikasi hanya meminta biometrik/PIN selama sesi masih berlaku (maks. 7 hari, atau 24 jam tanpa membuka aplikasi)
+- 5 kali PIN salah berturut-turut menghapus sesi lokal dan mewajibkan login penuh
 
 ---
 
@@ -2490,7 +2522,7 @@ Waktu hash 300 ms bersifat disengaja: membuat brute force mahal secara komputasi
 ## Fase 2
 
 **F-001: Alur Authorization Code + PKCE (atau app attestation) untuk Mobile Approval**
-Corporate Portal tidak lagi butuh migrasi ini sejak §11.1/§16.1 — BFF-nya sudah autentikasi ke Auth Service lewat mTLS mesh (Istio `AuthorizationPolicy`), yang sudah menutup celah `client_id` tak-terautentikasi yang dimiliki ROPC. Bank Administration Portal ditangani lewat F-012. `POST /api/v1/auth/mobile/login` (Mobile Approval) adalah satu-satunya client yang identitas app-nya belum dibuktikan secara kriptografis **dan** dapat dijangkau dari internet; perkuat lewat Authorization Code + PKCE atau app attestation platform (Play Integrity / App Attest), agar tidak lagi bergantung pada `client_id` yang diklaim sendiri di jalur itu juga.
+Corporate Portal tidak lagi butuh migrasi ini sejak §11.1/§16.1 — BFF-nya sudah autentikasi ke Auth Service lewat mTLS mesh (Istio `AuthorizationPolicy`), yang sudah menutup celah `client_id` tak-terautentikasi yang dimiliki ROPC. Bank Administration Portal ditangani lewat F-012. `POST /api/v1/auth/mobile/login` (Mobile Approval) adalah satu-satunya client yang identitas app-nya belum dibuktikan secara kriptografis **dan** dapat dijangkau dari internet; perkuat lewat Authorization Code + PKCE atau app attestation platform (Play Integrity / App Attest), agar tidak lagi bergantung pada `client_id` yang diklaim sendiri di jalur itu juga. Sekaligus, ganti app lock lokal (FR-SESSION-006) dengan device-bound key: kunci privat di Secure Enclave/StrongBox yang hanya dapat dipakai setelah PIN/biometrik dan menandatangani setiap refresh, sehingga server dapat membuktikan app lock benar-benar dibuka.
 
 **F-002: Passkey / Login Tanpa Kata Sandi**
 Dukungan passkey penuh (kredensial FIDO2 yang dapat ditemukan dan disinkronkan melalui keychain platform). Pengguna login dengan biometrik tanpa kata sandi.

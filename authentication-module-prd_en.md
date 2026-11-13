@@ -546,7 +546,14 @@ Corporate-level policy can mandate MFA. If mandatory and user has no active fact
 On successful authentication, create `AuthenticationSession` with unique session ID, identity reference, device reference, AAL, timestamps, idle timeout, absolute expiry, status `ACTIVE`.
 
 **FR-SESSION-002: Session Expiration**
-Both idle timeout (default: 15 min) and absolute timeout (default: 8 hours) are independently enforced. Expiry is evaluated lazily (at token refresh) and eagerly (background sweeper).
+Both idle timeout and absolute timeout are independently enforced. Their values are set per client when the session is created, based on the login endpoint called, and stored in `idle_timeout_secs` and `absolute_expires_at`:
+
+| Client | Idle timeout | Absolute timeout |
+|---|---|---|
+| Corporate Portal, Bank Administration Portal (web) | 15 min | 8 hours |
+| Mobile Approval (`/auth/mobile/login`) | 24 hours | 7 days |
+
+The long Mobile Approval session is only safe because the app is locked with a PIN/biometrics (FR-SESSION-006). Expiry is evaluated lazily (at token refresh) and eagerly (background sweeper).
 
 - **Lazy:** before issuing new tokens, refresh rejects a session whose `last_activity_at + idle_timeout_secs` or `absolute_expires_at` has passed, and marks it `EXPIRED`.
   - **Minimum remaining threshold:** refresh is also rejected when the time left until `absolute_expires_at` is below a minimum threshold (default: 30 seconds, configurable). The session is marked `EXPIRED` immediately with reason `SESSION_EXPIRED_ABSOLUTE`, instead of issuing an Access Token that expires almost at once (see FR-TOKEN-001).
@@ -567,7 +574,21 @@ API calls with an Access Token are verified at the API Gateway and do **not** up
 
 - The client refreshes before the Access Token expires, at ~80% of its lifetime (default: minute 12), rather than waiting for expiry or an `ERR-TOKEN-004` response.
 - Proactive refresh happens only if there has been user activity (UI input/navigation) since the last refresh. With no activity, the client does not refresh, so the session ends by idle timeout as intended; background timers or polling must not count as activity.
-- This applies to the Corporate Portal BFF, the Bank Administration Portal SPA, and Mobile Approval.
+- This applies to the Corporate Portal BFF and the Bank Administration Portal SPA. On Mobile Approval, refresh happens every time the app lock is opened (FR-SESSION-006) and proactively while the app is in the foreground. With a 24-hour idle timeout, an approver only needs to open the app once a day to keep the session alive.
+
+**FR-SESSION-006: Mobile Approval App Lock (PIN & Biometrics)**
+The app lock replaces frequent re-login on Mobile Approval; it does **not** replace MFA, which remains mandatory on every full login.
+
+- **Mandatory onboarding:** after the first full login (password + MFA) on a device, the app shows app-lock onboarding before the home screen:
+  1. Create a 6-digit app PIN (mandatory). Sequential or repeated PINs (e.g. `123456`, `111111`) are rejected.
+  2. Enable biometrics (Face ID / fingerprint): offered, optional, and can be enabled later from settings. The PIN remains the fallback when biometrics fail.
+  If onboarding is cancelled, the app does not store the Refresh Token, so the user must do a full login again the next time they open the app.
+- **Refresh Token storage:** in platform secure storage (iOS Keychain / Android Keystore, hardware-backed where available) with an access control that requires the app lock to be opened before the token can be read. The Refresh Token is never stored in plain text.
+- **When the app lock is required:** on app launch (cold start) and when returning from the background after ≥ 5 minutes (configurable).
+- **Wrong PIN:** after 5 consecutive wrong attempts, the app deletes the Refresh Token and local session data; the user must do a full login and redo onboarding. The server-side session ends by idle timeout, or the user can revoke it from the session list (FR-SESSION-004).
+- **Biometric change:** if the device's biometric data changes (e.g. a new fingerprint is added), the platform invalidates the biometric key; the user unlocks with the PIN and re-enables biometrics.
+- **Forgotten PIN:** full login (password + MFA), then create a new PIN; old local session data is deleted.
+- **Phase 1 limitation:** the PIN and biometrics are verified locally on the device; the server cannot prove the app lock is actually in place. Hardening (a device-bound key usable only after the app lock is opened that signs every refresh, or app attestation) is part of F-001.
 
 ## 8.4 Device Management
 
@@ -640,7 +661,7 @@ Phased (see §16.3):
 - **Phase 2 — RS256** (RSA 2048-bit minimum; RSA 4096-bit preferred). Public key at `/.well-known/jwks.json`. Key rotation every 90 days. Private key in HSM/Vault (F-011).
 
 **FR-TOKEN-003: Refresh Token**
-Opaque, cryptographically random (minimum 32 bytes). Store only SHA-256 hash server-side. Lifetime: 24 hours (web), 7 days (mobile). Bound to session.
+Opaque, cryptographically random (minimum 32 bytes). Store only SHA-256 hash server-side. Bound to the session: the Refresh Token's `expires_at` follows its session's `absolute_expires_at` (8 hours for web, 7 days for Mobile Approval; FR-SESSION-002) and never exceeds it. The Refresh Token is invalidated whenever its session ends for any reason. Storage on Mobile Approval follows FR-SESSION-006.
 
 **FR-TOKEN-004: Refresh Token Rotation**
 On exchange: validate token, validate session, mark old token `USED`, generate new token, issue new Access Token.
@@ -741,6 +762,17 @@ Publish signing public keys at `/.well-known/jwks.json` (RFC 7517). Not availabl
 - Any individual session can be revoked
 - Revocation immediately invalidates associated tokens
 - Current session is clearly identified
+
+## US-010: Mobile Approval App Lock Onboarding
+**As a** Mobile Approver, **I want to** open the app with biometrics or a PIN, **So that** I don't have to log in with a password and MFA every time I approve a transaction.
+
+**Acceptance Criteria:**
+- After the first login on a device, app-lock onboarding appears before the home screen and cannot be skipped
+- Creating a 6-digit PIN is mandatory; sequential or repeated PINs are rejected
+- Enabling biometrics is offered and can be skipped; it can be enabled later from settings
+- If onboarding is cancelled, the session is not stored and the user must do a full login the next time they open the app
+- After onboarding, opening the app only asks for biometrics/PIN while the session is valid (max. 7 days, or 24 hours without opening the app)
+- 5 consecutive wrong PINs delete the local session and require a full login
 
 ---
 
@@ -2490,7 +2522,7 @@ The 300ms hash time is intentional: makes brute-force computationally expensive 
 ## Phase 2
 
 **F-001: Authorization Code + PKCE Flow (or app attestation) for Mobile Approval**
-Corporate Portal no longer needs this migration as of §11.1/§16.1 — its BFF authenticates to the Authentication Service via mesh mTLS (Istio `AuthorizationPolicy`), which already removes the unauthenticated-`client_id` gap ROPC had. The Bank Administration Portal is handled by F-012. `POST /api/v1/auth/mobile/login` (Mobile Approval) is the one client where the calling app is not cryptographically verified **and** that is reachable from the internet; harden it via Authorization Code + PKCE or platform app attestation (Play Integrity / App Attest), eliminating reliance on a self-declared `client_id` there too.
+Corporate Portal no longer needs this migration as of §11.1/§16.1 — its BFF authenticates to the Authentication Service via mesh mTLS (Istio `AuthorizationPolicy`), which already removes the unauthenticated-`client_id` gap ROPC had. The Bank Administration Portal is handled by F-012. `POST /api/v1/auth/mobile/login` (Mobile Approval) is the one client where the calling app is not cryptographically verified **and** that is reachable from the internet; harden it via Authorization Code + PKCE or platform app attestation (Play Integrity / App Attest), eliminating reliance on a self-declared `client_id` there too. At the same time, replace the local app lock (FR-SESSION-006) with a device-bound key: a private key in the Secure Enclave/StrongBox usable only after the PIN/biometrics that signs every refresh, so the server can prove the app lock was actually opened.
 
 **F-002: Passkey / Passwordless Login**
 Full passkey support (FIDO2 discoverable credentials synchronized via platform keychain). Users log in with biometrics and no password.
